@@ -81,24 +81,7 @@ from recognition.face_id import FaceIdentifier
 from recognition.voice_id import VoiceIdentifier
 from recognition.wake_word import WakeWordDetector
 
-from actions.file_processor    import file_processor
-from actions.flight_finder     import flight_finder
-from actions.open_app          import open_app
-from actions.weather_report    import weather_action
-from actions.send_message      import send_message
-from actions.reminder          import reminder
-from actions.computer_settings import computer_settings
-from actions.screen_processor  import screen_process
-from actions.youtube_video     import youtube_video
-from actions.desktop           import desktop_control
-from actions.browser_control   import browser_control
-from actions.file_controller   import file_controller
-from actions.code_helper       import code_helper
-from actions.dev_agent         import dev_agent
-from actions.web_search        import web_search as web_search_action
-from actions.computer_control  import computer_control
-from actions.game_updater      import game_updater
-
+from core.tool_dispatch import TOOL_DISPATCH
 from config import load_config, BASE_DIR
 
 # ── Paths ────────────────────────────────────────────────────────────────────
@@ -773,77 +756,7 @@ class JarvisXL:
 
         result = "Done."
         try:
-            if name == "open_app":
-                r = open_app(parameters=args, response=None, player=self.ui)
-                result = r or f"Opened {args.get('app_name')}."
-
-            elif name == "weather_report":
-                r = weather_action(parameters=args, player=self.ui)
-                result = r or "Weather delivered."
-
-            elif name == "browser_control":
-                r = browser_control(parameters=args, player=self.ui)
-                result = r or "Done."
-
-            elif name == "file_controller":
-                r = file_controller(parameters=args, player=self.ui)
-                result = r or "Done."
-
-            elif name == "send_message":
-                r = send_message(parameters=args, response=None, player=self.ui, session_memory=None)
-                result = r or f"Message sent to {args.get('receiver')}."
-
-            elif name == "reminder":
-                r = reminder(parameters=args, response=None, player=self.ui)
-                result = r or "Reminder set."
-
-            elif name == "youtube_video":
-                r = youtube_video(parameters=args, response=None, player=self.ui)
-                result = r or "Done."
-
-            elif name == "screen_process":
-                r = screen_process(parameters=args, response=None, player=self.ui, session_memory=None)
-                result = r if isinstance(r, str) and r else "Screen analyzed."
-
-            elif name == "computer_settings":
-                r = computer_settings(parameters=args, response=None, player=self.ui)
-                result = r or "Done."
-
-            elif name == "desktop_control":
-                r = desktop_control(parameters=args, player=self.ui)
-                result = r or "Done."
-
-            elif name == "code_helper":
-                r = code_helper(parameters=args, player=self.ui, speak=self.speak)
-                result = r or "Done."
-
-            elif name == "dev_agent":
-                r = dev_agent(parameters=args, player=self.ui, speak=self.speak)
-                result = r or "Done."
-
-            elif name == "web_search":
-                r = web_search_action(parameters=args, player=self.ui)
-                result = r or "Done."
-
-            elif name == "file_processor":
-                if not args.get("file_path") and self.ui.current_file:
-                    args["file_path"] = self.ui.current_file
-                r = file_processor(parameters=args, player=self.ui, speak=self.speak)
-                result = r or "Done."
-
-            elif name == "computer_control":
-                r = computer_control(parameters=args, player=self.ui)
-                result = r or "Done."
-
-            elif name == "game_updater":
-                r = game_updater(parameters=args, player=self.ui, speak=self.speak)
-                result = r or "Done."
-
-            elif name == "flight_finder":
-                r = flight_finder(parameters=args, player=self.ui)
-                result = r or "Done."
-
-            elif name == "shutdown_jarvis":
+            if name == "shutdown_jarvis":
                 self.ui.write_log("SYS: Shutdown requested.")
                 def _shutdown():
                     import time, os
@@ -852,6 +765,9 @@ class JarvisXL:
                     os._exit(0)
                 threading.Thread(target=_shutdown, daemon=True).start()
                 return "Shutting down."
+
+            elif name in TOOL_DISPATCH:
+                result = TOOL_DISPATCH[name](args, self.ui, self.speak)
 
             else:
                 result = f"Unknown tool: {name}"

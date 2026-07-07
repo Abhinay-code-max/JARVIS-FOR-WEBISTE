@@ -211,6 +211,15 @@ def _open_vscode(project_dir: Path) -> bool:
     ]
     for cmd in vscode_candidates:
         try:
+            # shell=True is required here — code.cmd can't be launched via
+            # CreateProcess directly without shell resolution (confirmed:
+            # shell=False fails with WinError 2). Not an injection risk in
+            # practice: project_dir is always PROJECTS_DIR / proj_name,
+            # where proj_name has already been stripped to [\w-] only
+            # (see re.sub above), and the list form is Windows-quoted via
+            # list2cmdline before cmd.exe ever sees it — unlike open_app.py's
+            # previous string-interpolation pattern, this isn't raw
+            # concatenation of untrusted text into a shell command line.
             subprocess.Popen(
                 [cmd, str(project_dir)],
                 shell=True,

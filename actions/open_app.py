@@ -79,11 +79,14 @@ def _normalize(raw: str) -> str:
 
 def _launch_windows(app_name: str) -> bool:
 
-    if shutil.which(app_name) or shutil.which(app_name.split(".")[0]):
+    resolved = shutil.which(app_name) or shutil.which(app_name.split(".")[0])
+    if resolved:
         try:
+            # Launch the resolved executable path directly as a single
+            # argv element — no shell involved, so no shell metacharacter
+            # in app_name (&, |, >, ...) can inject a second command.
             subprocess.Popen(
-                app_name,
-                shell=True,
+                [resolved],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -94,7 +97,15 @@ def _launch_windows(app_name: str) -> bool:
 
     if ":" in app_name:
         try:
-            subprocess.Popen(f"start {app_name}", shell=True)
+            # "start" is a cmd.exe builtin, not a real executable, so it
+            # can't be launched without going through cmd — but passing
+            # app_name as its own list element (rather than string-
+            # interpolating it into a shell command) means cmd receives it
+            # as a single literal argument, not shell-parsed text. The
+            # empty "" is the conventional placeholder "start" needs for
+            # its optional window-title argument when the target itself
+            # might contain spaces.
+            subprocess.Popen(["cmd", "/c", "start", "", app_name])
             time.sleep(1.0)
             return True
         except Exception:

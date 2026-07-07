@@ -551,6 +551,13 @@ class JarvisXL:
         self._tts_ready        = threading.Event()
         self._speaking         = False
         self._speaking_lock    = threading.Lock()
+        # Echo-gating: suppress mic input while JARVIS is speaking, plus a
+        # short grace period after TTS finishes, so speaker->mic bleed
+        # (very common without a headset — no acoustic echo cancellation
+        # in this pipeline) doesn't get transcribed and re-processed as a
+        # phantom user command.
+        self._speech_end_time: float = 0.0
+        self._echo_grace_sec:  float = 0.6
         self._text_queue:      queue.Queue = queue.Queue()
         self._tts_queue:       queue.Queue = queue.Queue()
         self._conversation:    list[dict]  = []
@@ -644,9 +651,17 @@ class JarvisXL:
                 self._tts_queue.task_done()
                 if self._tts_queue.empty():
                     with self._speaking_lock:
-                        self._speaking = False
+                        self._speaking         = False
+                        self._speech_end_time  = time.time() + self._echo_grace_sec
                     if not self.ui.muted:
                         self.ui.set_state("LISTENING")
+
+    def _echo_gated(self) -> bool:
+        """True while JARVIS is speaking, or within the grace window right
+        after — listen loops should drop audio during this time."""
+        if self._speaking:
+            return True
+        return time.time() < self._speech_end_time
 
     def speak(self, text: str) -> None:
         if not text or not self._tts:
@@ -964,7 +979,7 @@ class JarvisXL:
     def _listen_whisper(self) -> None:
         vad = _VADBuffer()
         def _cb(indata, frames, time_info, status):
-            if self.ui.muted: return
+            if self.ui.muted or self._echo_gated(): return
             audio = indata[:, 0].astype(np.float32)
             utterance = vad.process(audio)
             if utterance is not None:
@@ -984,7 +999,7 @@ class JarvisXL:
         stt_language = self._config.get("stt_language", "auto")
 
         def _on_transcript(text: str) -> None:
-            if self.ui.muted: return
+            if self.ui.muted or self._echo_gated(): return
             if text and text.strip():
                 self._enqueue_command(text.strip())
 
@@ -999,7 +1014,7 @@ class JarvisXL:
     def _listen_vosk(self) -> None:
         vad = _VADBuffer()
         def _cb(indata, frames, time_info, status):
-            if self.ui.muted: return
+            if self.ui.muted or self._echo_gated(): return
             audio = indata[:, 0].astype(np.float32)
             utterance = vad.process(audio)
             if utterance is not None:

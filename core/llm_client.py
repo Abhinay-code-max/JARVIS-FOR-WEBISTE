@@ -21,23 +21,15 @@ import re
 import subprocess
 import sys
 import time
-from pathlib import Path
 from typing import Generator
 
 import requests
 
+from config import load_config as _load_config
+
 # Matches a sentence boundary: [.!?] followed by whitespace, or a blank line.
 # Avoids splitting on decimals (3.5) because those have no space after the dot.
 _SENT_END = re.compile(r'(?<=[.!?])\s+|(?<=\n)\s*\n')
-
-def get_base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
-
-
-BASE_DIR    = get_base_dir()
-CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 
 _DEFAULTS = {
     "llm_url":      "http://localhost:11434",
@@ -50,13 +42,6 @@ def get_llm_provider() -> str:
     """Returns 'ollama' or 'openai' (covers LM Studio, LocalAI, Jan, etc.)."""
     raw = _load_config().get("llm_provider", "ollama").strip().lower()
     return "openai" if raw in ("openai", "lmstudio", "localai", "jan", "llamacpp") else "ollama"
-
-
-def _load_config() -> dict:
-    try:
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
 
 
 def ensure_ollama_running(timeout: int = 15) -> bool:
@@ -333,6 +318,43 @@ def call_llm_text(
         )
     except Exception as e:
         raise RuntimeError(f"LLM text call failed: {e}")
+
+
+def call_llm_vision(
+    prompt:      str,
+    image_bytes: bytes,
+    model:       str | None = None,
+    timeout:     int = 120,
+) -> str:
+    """
+    Single-image vision generation via Ollama's /api/chat "images" field
+    (base64-encoded). Requires a vision-capable model — config key
+    "vision_model", default "qwen2.5vl:7b". Ollama-only: this codebase has
+    no OpenAI-compatible vision path configured.
+    """
+    import base64
+    cfg = _load_config()
+    url = cfg.get("llm_url", _DEFAULTS["llm_url"]).rstrip("/")
+    m   = model or cfg.get("vision_model") or "qwen2.5vl:7b"
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+
+    payload = {
+        "model":      m,
+        "stream":     False,
+        "keep_alive": -1,
+        "messages":   [{"role": "user", "content": prompt, "images": [b64]}],
+    }
+    try:
+        resp = requests.post(f"{url}/api/chat", json=payload, timeout=timeout)
+        resp.raise_for_status()
+        return (resp.json().get("message", {}).get("content") or "").strip()
+    except requests.exceptions.ConnectionError:
+        raise RuntimeError(
+            f"Cannot connect to Ollama at {url}. "
+            "Make sure Ollama is installed and run: ollama serve"
+        )
+    except Exception as e:
+        raise RuntimeError(f"LLM vision call failed: {e}")
 
 
 def _stream_openai(

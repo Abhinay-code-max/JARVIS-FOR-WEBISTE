@@ -2,20 +2,9 @@
 import json
 import re
 import subprocess
-import sys
 from datetime import datetime, timedelta
-from pathlib import Path
 
 from config import is_windows, is_mac, is_linux
-
-def _get_base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
-
-
-BASE_DIR        = _get_base_dir()
-API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 
 
 _MONTH_MAP: dict[str, int] = {

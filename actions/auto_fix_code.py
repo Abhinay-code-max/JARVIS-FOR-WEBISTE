@@ -7,7 +7,6 @@ to the LLM for a fix, writes the fix back, and re-runs to verify.
 """
 
 from __future__ import annotations
-import json
 import re
 import subprocess
 import sys
@@ -15,18 +14,7 @@ from pathlib import Path
 from typing import Optional
 
 
-def _base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
-
-
-def _load_config() -> dict:
-    try:
-        cfg_path = _base_dir() / "config" / "api_keys.json"
-        return json.loads(cfg_path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+from config import load_config as _load_config
 
 
 def _run_script(file_path: str, timeout: int = 15) -> tuple[bool, str, str]:

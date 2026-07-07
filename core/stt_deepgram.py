@@ -10,11 +10,11 @@ import io
 import json
 import threading
 import time
-from pathlib import Path
-import sys
 
 import numpy as np
 import sounddevice as sd
+
+from config import load_config
 
 SAMPLE_RATE = 16_000
 CHANNELS    = 1
@@ -22,12 +22,7 @@ BLOCK_SIZE  = 4_000
 
 
 def _get_api_key() -> str:
-    try:
-        base = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent.parent
-        cfg  = json.loads((base / "config" / "api_keys.json").read_text(encoding="utf-8"))
-        return cfg.get("deepgram_api_key", "")
-    except Exception:
-        return ""
+    return load_config().get("deepgram_api_key", "")
 
 
 class DeepgramSTT:

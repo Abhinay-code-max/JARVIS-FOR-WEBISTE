@@ -1,7 +1,6 @@
 #computer_settings.py
 import json
 import re
-import sys
 import time
 import subprocess
 import platform
@@ -23,11 +22,6 @@ except ImportError:
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 
-
-def _get_base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
 
 def _get_macos_wifi_interface() -> str:
     try:

@@ -15,15 +15,7 @@ from typing import Callable
 from agent.planner       import create_plan, replan
 from agent.error_handler import analyze_error, generate_fix, ErrorDecision
 from core.llm_client     import call_llm_text
-
-
-def get_base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
-
-
-BASE_DIR = get_base_dir()
+from config              import BASE_DIR
 
 
 # ---------------------------------------------------------------------------

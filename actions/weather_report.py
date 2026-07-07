@@ -1,24 +1,10 @@
-import json
-import sys
-from pathlib import Path
-
 import requests
 
-
-def _base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
+from config import load_config
 
 
 def _get_api_key() -> str:
-    try:
-        cfg = json.loads(
-            (_base_dir() / "config" / "api_keys.json").read_text(encoding="utf-8")
-        )
-        return cfg.get("openweather_api_key", "").strip()
-    except Exception:
-        return ""
+    return load_config().get("openweather_api_key", "").strip()
 
 
 def _log(msg: str, player=None) -> None:

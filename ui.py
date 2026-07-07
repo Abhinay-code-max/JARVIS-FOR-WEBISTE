@@ -28,14 +28,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget, QProgressBar,
 )
 
-def _base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent
-
-BASE_DIR   = _base_dir()
-CONFIG_DIR = BASE_DIR / "config"
-API_FILE   = CONFIG_DIR / "api_keys.json"
+from config import load_config, save_config, config_exists, is_configured
 
 _DEFAULT_W, _DEFAULT_H = 980, 700
 _MIN_W,     _MIN_H     = 820, 580
@@ -1956,14 +1949,9 @@ class MainWindow(QMainWindow):
         self.hud.speaking = (state == "SPEAKING")
 
     def _check_config(self) -> bool:
-        if not API_FILE.exists(): return False
+        if not config_exists(): return False
         try:
-            d = json.loads(API_FILE.read_text(encoding="utf-8"))
-            return (
-                bool(d.get("llm_model")) and
-                bool(d.get("stt_engine")) and
-                bool(d.get("tts_engine"))
-            )
+            return is_configured()
         except Exception:
             return False
 
@@ -1985,11 +1973,7 @@ class MainWindow(QMainWindow):
             cfg = json.loads(config_json)
         except Exception:
             cfg = {}
-        os.makedirs(CONFIG_DIR, exist_ok=True)
-        API_FILE.write_text(
-            json.dumps(cfg, indent=4),
-            encoding="utf-8",
-        )
+        save_config(cfg)
         self._ready = True
         if self._overlay:
             self._overlay.hide()
@@ -2007,7 +1991,7 @@ class MainWindow(QMainWindow):
             return
         current: dict = {}
         try:
-            current = json.loads(API_FILE.read_text(encoding="utf-8"))
+            current = load_config(force_reload=True)
         except Exception:
             pass
         ov = SetupOverlay(self.centralWidget(), initial=current, mode="config")
@@ -2027,8 +2011,7 @@ class MainWindow(QMainWindow):
             cfg = json.loads(config_json)
         except Exception:
             cfg = {}
-        os.makedirs(CONFIG_DIR, exist_ok=True)
-        API_FILE.write_text(json.dumps(cfg, indent=4), encoding="utf-8")
+        save_config(cfg)
         if self._overlay:
             self._overlay.hide()
             self._overlay = None

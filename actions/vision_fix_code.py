@@ -16,7 +16,6 @@ import base64
 import io
 import json
 import re
-import sys
 from pathlib import Path
 from typing import Optional
 
@@ -42,19 +41,7 @@ except ImportError:
     _PYGETWINDOW = False
 
 
-def _base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
-
-
-def _load_config() -> dict:
-    try:
-        return json.loads(
-            (_base_dir() / "config" / "api_keys.json").read_text(encoding="utf-8")
-        )
-    except Exception:
-        return {}
+from config import load_config as _load_config, BASE_DIR
 
 
 def _capture_screen() -> bytes:
@@ -120,7 +107,7 @@ def _get_search_roots() -> list[str]:
         pass
 
     # JARVIS project dir itself
-    roots.append(str(_base_dir()))
+    roots.append(str(BASE_DIR))
 
     # De-duplicate while preserving order
     seen = set()

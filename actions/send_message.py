@@ -1,8 +1,9 @@
 import json
 import subprocess
-import sys
 import time
 from pathlib import Path
+
+from config import load_config, BASE_DIR
 
 try:
     import pyautogui
@@ -19,18 +20,9 @@ except ImportError:
     _PYPERCLIP = False
 
 
-def _base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
-
-
 def _get_os() -> str:
     try:
-        cfg = json.loads(
-            (_base_dir() / "config" / "api_keys.json").read_text(encoding="utf-8")
-        )
-        return cfg.get("os_system", "windows").lower()
+        return load_config().get("os_system", "windows").lower()
     except Exception:
         return "windows"
 
@@ -38,7 +30,7 @@ def _get_os() -> str:
 def _load_contacts() -> dict:
     """Load contacts from config/contacts.json — {alias: exact_whatsapp_name}"""
     try:
-        p = _base_dir() / "config" / "contacts.json"
+        p = BASE_DIR / "config" / "contacts.json"
         if p.exists():
             return json.loads(p.read_text(encoding="utf-8"))
     except Exception:

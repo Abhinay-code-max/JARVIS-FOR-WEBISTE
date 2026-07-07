@@ -1,29 +1,15 @@
 import json
-import sys
 from datetime import datetime
 from pathlib import Path
 
 import requests
 
-
-def _base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
-
-
-def _load_config() -> dict:
-    try:
-        return json.loads(
-            (_base_dir() / "config" / "api_keys.json").read_text(encoding="utf-8")
-        )
-    except Exception:
-        return {}
+from config import load_config as _load_config, BASE_DIR
 
 
 def _load_memory() -> dict:
     """Load memory — tries both possible filenames for compatibility."""
-    mem_dir = _base_dir() / "memory"
+    mem_dir = BASE_DIR / "memory"
     for fname in ("long_term.json", "long_term_memory.json"):
         p = mem_dir / fname
         if p.exists():
@@ -112,7 +98,7 @@ def _get_weather_summary(city: str, api_key: str) -> str:
 
 def _get_pending_reminders() -> list[str]:
     try:
-        rem_path = _base_dir() / "memory" / "reminders.json"
+        rem_path = BASE_DIR / "memory" / "reminders.json"
         if not rem_path.exists():
             return []
         reminders = json.loads(rem_path.read_text(encoding="utf-8"))

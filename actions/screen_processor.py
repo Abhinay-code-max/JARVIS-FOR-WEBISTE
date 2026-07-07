@@ -7,9 +7,6 @@ from __future__ import annotations
 
 import base64
 import io
-import json
-import sys
-from pathlib import Path
 from typing import Optional, Callable
 
 try:
@@ -36,32 +33,16 @@ import platform
 import requests
 
 
-def _base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
-
-
-_BASE        = _base_dir()
-_CONFIG_PATH = _BASE / "config" / "api_keys.json"
+from config import load_config as _load_config, set_config_key
 
 _IMG_MAX_W = 640
 _IMG_MAX_H = 360
 _JPEG_Q    = 60
 
 
-def _load_config() -> dict:
-    try:
-        return json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
 def _save_config_key(key: str, value) -> None:
     try:
-        cfg = _load_config()
-        cfg[key] = value
-        _CONFIG_PATH.write_text(json.dumps(cfg, indent=4), encoding="utf-8")
+        set_config_key(key, value)
     except Exception as e:
         print(f"[Vision] ⚠️ Could not save config key '{key}': {e}")
 

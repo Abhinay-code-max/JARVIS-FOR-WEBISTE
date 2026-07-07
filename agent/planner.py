@@ -4,19 +4,9 @@ Replaces google.generativeai with local Ollama via core.llm_client.
 """
 import json
 import re
-import sys
-from pathlib import Path
 
 from core.llm_client import call_llm_text
-
-
-def get_base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
-
-
-BASE_DIR = get_base_dir()
+from config import BASE_DIR
 
 
 PLANNER_PROMPT = """You are the planning module of MARK XL, a personal AI assistant.

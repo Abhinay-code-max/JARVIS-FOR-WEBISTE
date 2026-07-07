@@ -5,13 +5,8 @@ import re
 import time
 from pathlib import Path
 
+from config import BASE_DIR
 
-def get_base_dir():
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
-
-BASE_DIR           = get_base_dir()
 DESKTOP            = Path.home() / "Desktop"
 MAX_BUILD_ATTEMPTS = 3
 
@@ -387,16 +382,10 @@ def _screen_debug_action(description, file_path, player, speak=None) -> str:
             print(f"[Code] ⚠️ Could not read file: {err}")
 
     try:
-        import base64, json as _json, requests as _req
-        from pathlib import Path as _Path
+        import base64, requests as _req
+        from config import load_config as _load_config
 
-        cfg          = {}
-        cfg_file     = _Path(__file__).resolve().parent.parent / "config" / "api_keys.json"
-        try:
-            cfg = _json.loads(cfg_file.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-
+        cfg           = _load_config()
         ollama_url    = cfg.get("llm_url", "http://localhost:11434").rstrip("/")
         vision_model  = cfg.get("vision_model") or cfg.get("llm_model", "llava")
 

@@ -16,25 +16,76 @@ Supported types:
   pptx    → summarize, extract_text, to_pdf
 """
 
+import io
 import os
 import re
 import json
 import shutil
+import hashlib
 import subprocess
 import tempfile
 from pathlib import Path
 from datetime import datetime
 
 from core.llm_client import call_llm_text as _llm_text
+from core.llm_client import call_llm_vision as _llm_vision
+
+
+def _transcribe_audio_bytes(data: bytes, mime: str = "audio/wav") -> str:
+    """Transcribe raw audio bytes via the local Whisper STT engine.
+
+    No model configured anywhere in this codebase accepts raw audio bytes
+    over Ollama's /api/chat — that's a text+image API, not an audio one —
+    so this reuses the same offline STT engine (core/stt.py) that already
+    powers the mic pipeline, instead of silently mishandling the bytes.
+    """
+    import numpy as np
+    from pydub import AudioSegment
+    from core.stt import WhisperSTT
+
+    # pydub can only skip the ffmpeg subprocess (not always installed) for
+    # formats it can parse natively; passing the real format explicitly
+    # (instead of letting it guess from a nameless BytesIO) is what makes
+    # that fast path trigger for plain WAV.
+    fmt = mime.split("/")[-1].replace("x-", "")
+    seg = AudioSegment.from_file(io.BytesIO(data), format=fmt).set_frame_rate(16000).set_channels(1).set_sample_width(2)
+    samples = np.frombuffer(seg.raw_data, dtype=np.int16).astype(np.float32) / 32768.0
+    return WhisperSTT(model_name="base").transcribe(samples)
 
 
 def _gemini_client():
-    # Compatibility shim — returns an object with .generate_content()
+    # Compatibility shim — returns an object with .generate_content().
+    #
+    # Call sites in this file pass either a plain string (routed to the
+    # local text model), or a 2-element list [instruction, media] where
+    # media is a PIL.Image (routed to the local vision model) or a
+    # {"mime_type", "data"} dict describing audio bytes (routed to local
+    # Whisper STT). Previously this shim only accepted a string, so the
+    # list form silently failed JSON-serialization before ever reaching
+    # a model — the image/audio content never influenced the response.
     class _Shim:
-        def generate_content(self, prompt: str) -> "_R":
+        def generate_content(self, prompt) -> "_R":
             class _R:
                 pass
             r = _R()
+            if isinstance(prompt, list) and len(prompt) >= 2:
+                text, media = prompt[0], prompt[1]
+                if hasattr(media, "save"):  # PIL.Image
+                    buf = io.BytesIO()
+                    media.convert("RGB").save(buf, format="PNG")
+                    sent_bytes = buf.getvalue()
+                    debug_path = Path(tempfile.gettempdir()) / "jarvis_last_sent_vision_image.png"
+                    debug_path.write_bytes(sent_bytes)
+                    print(f"[FileProcessor][vision] sent size    = {len(sent_bytes)} bytes")
+                    print(f"[FileProcessor][vision] sent md5     = {hashlib.md5(sent_bytes).hexdigest()}")
+                    print(f"[FileProcessor][vision] sent dims    = {media.size}")
+                    print(f"[FileProcessor][vision] sent copy saved to = {debug_path}")
+                    r.text = _llm_vision(text, sent_bytes)
+                    print(f"[FileProcessor][vision] RAW model response = {r.text!r}")
+                    return r
+                if isinstance(media, dict) and "data" in media:
+                    r.text = _transcribe_audio_bytes(media["data"], media.get("mime_type", "audio/wav"))
+                    return r
             r.text = _llm_text(prompt)
             return r
     return _Shim()
@@ -88,8 +139,13 @@ def _process_image(path: Path, action: str, params: dict, speak=None) -> str:
 
     if action in ("describe", "ocr", "analyze", "read", "extract_text"):
         try:
+            src_bytes = path.read_bytes()
+            print(f"[FileProcessor][vision] source file  = {path}")
+            print(f"[FileProcessor][vision] source size   = {len(src_bytes)} bytes")
+            print(f"[FileProcessor][vision] source md5    = {hashlib.md5(src_bytes).hexdigest()}")
             model  = _gemini_client()
             img    = Image.open(path)
+            print(f"[FileProcessor][vision] decoded dims  = {img.size} mode={img.mode}")
             prompt = {
                 "describe": "Describe this image in detail.",
                 "ocr":      "Extract all text visible in this image. Return only the text, formatted clearly.",

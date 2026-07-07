@@ -10,7 +10,7 @@ from config import BASE_DIR
 DESKTOP            = Path.home() / "Desktop"
 MAX_BUILD_ATTEMPTS = 3
 
-from core.llm_client import call_llm_text as _llm
+from core.llm_client import call_llm_text as _llm, call_llm_vision as _llm_vision
 
 
 def _clean_code(text: str) -> str:
@@ -382,15 +382,12 @@ def _screen_debug_action(description, file_path, player, speak=None) -> str:
             print(f"[Code] ⚠️ Could not read file: {err}")
 
     try:
-        import base64, requests as _req
         from config import load_config as _load_config
 
         cfg           = _load_config()
-        ollama_url    = cfg.get("llm_url", "http://localhost:11434").rstrip("/")
         vision_model  = cfg.get("vision_model") or cfg.get("llm_model", "llava")
 
         image_bytes   = screenshot_path.read_bytes()
-        b64           = base64.b64encode(image_bytes).decode("ascii")
         user_question = description or "What error or problem do you see on the screen? How can it be fixed?"
         context       = ""
         if file_content:
@@ -403,23 +400,7 @@ def _screen_debug_action(description, file_path, player, speak=None) -> str:
             f"If you see code, show the corrected version."
         )
 
-        resp = _req.post(
-            f"{ollama_url}/api/chat",
-            json={
-                "model":   vision_model,
-                "stream":  False,
-                "messages": [
-                    {
-                        "role":    "user",
-                        "content": analysis_prompt,
-                        "images":  [b64],
-                    }
-                ],
-            },
-            timeout=60,
-        )
-        resp.raise_for_status()
-        analysis = (resp.json().get("message", {}).get("content") or "").strip()
+        analysis = _llm_vision(analysis_prompt, image_bytes, model=vision_model, timeout=60).strip()
         print("[Code] ✅ Screen analysis complete")
 
         try:

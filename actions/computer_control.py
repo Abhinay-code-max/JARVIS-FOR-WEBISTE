@@ -10,6 +10,7 @@ import random
 from pathlib import Path
 
 from config import load_config as _load_config, BASE_DIR
+from core.llm_client import call_llm_vision as _llm_vision
 
 try:
     import pyautogui
@@ -287,12 +288,7 @@ def _focus_window(title: str) -> str:
 
 def _screen_find(description: str) -> tuple[int, int] | None:
     try:
-        import base64
-        import requests as _req
-
         cfg = _load_config()
-
-        ollama_url   = cfg.get("llm_url", "http://localhost:11434").rstrip("/")
         vision_model = cfg.get("vision_model") or cfg.get("llm_model", "llava")
 
         _require_pyautogui()
@@ -300,7 +296,6 @@ def _screen_find(description: str) -> tuple[int, int] | None:
         img   = pyautogui.screenshot()
         buf   = io.BytesIO()
         img.save(buf, format="PNG")
-        b64   = base64.b64encode(buf.getvalue()).decode("ascii")
 
         prompt = (
             f"This is a screenshot of a {w}×{h} pixel screen. "
@@ -309,17 +304,7 @@ def _screen_find(description: str) -> tuple[int, int] | None:
             f"If the element is not visible, reply: NOT_FOUND"
         )
 
-        resp = _req.post(
-            f"{ollama_url}/api/chat",
-            json={
-                "model":  vision_model,
-                "stream": False,
-                "messages": [{"role": "user", "content": prompt, "images": [b64]}],
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        text = (resp.json().get("message", {}).get("content") or "").strip()
+        text = _llm_vision(prompt, buf.getvalue(), model=vision_model, timeout=30).strip()
 
         if "NOT_FOUND" in text.upper():
             return None

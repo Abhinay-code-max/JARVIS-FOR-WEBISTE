@@ -5,7 +5,6 @@ The analysis text is returned (and optionally spoken via the `speak` callback).
 """
 from __future__ import annotations
 
-import base64
 import io
 from typing import Optional, Callable
 
@@ -30,10 +29,8 @@ except ImportError:
 
 import platform
 
-import requests
-
-
 from config import load_config as _load_config, set_config_key
+from core.llm_client import call_llm_vision as _llm_vision
 
 _IMG_MAX_W = 640
 _IMG_MAX_H = 360
@@ -172,29 +169,12 @@ _SYSTEM_PROMPT = (
 
 def _call_vision(image_bytes: bytes, mime: str, user_text: str) -> str:
     cfg          = _load_config()
-    url          = cfg.get("llm_url", "http://localhost:11434").rstrip("/")
     vision_model = cfg.get("vision_model") or "qwen2.5vl:7b"
 
-    b64 = base64.b64encode(image_bytes).decode("ascii")
-
-    payload = {
-        "model":  vision_model,
-        "stream": False,
-        "messages": [
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {
-                "role":    "user",
-                "content": user_text,
-                "images":  [b64],
-            },
-        ],
-    }
     try:
-        resp = requests.post(f"{url}/api/chat", json=payload, timeout=60)
-        resp.raise_for_status()
-        return (resp.json().get("message", {}).get("content") or "").strip()
-    except requests.exceptions.ConnectionError:
-        return "Cannot connect to Ollama. Make sure Ollama is running."
+        return _llm_vision(
+            user_text, image_bytes, system=_SYSTEM_PROMPT, model=vision_model, timeout=60,
+        ).strip()
     except Exception as e:
         return f"Vision analysis failed: {e}"
 

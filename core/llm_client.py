@@ -323,6 +323,7 @@ def call_llm_text(
 def call_llm_vision(
     prompt:      str,
     image_bytes: bytes,
+    system:      str | None = None,
     model:       str | None = None,
     timeout:     int = 120,
 ) -> str:
@@ -338,11 +339,16 @@ def call_llm_vision(
     m   = model or cfg.get("vision_model") or "qwen2.5vl:7b"
     b64 = base64.b64encode(image_bytes).decode("ascii")
 
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt, "images": [b64]})
+
     payload = {
         "model":      m,
         "stream":     False,
         "keep_alive": -1,
-        "messages":   [{"role": "user", "content": prompt, "images": [b64]}],
+        "messages":   messages,
     }
     try:
         resp = requests.post(f"{url}/api/chat", json=payload, timeout=timeout)

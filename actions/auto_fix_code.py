@@ -15,6 +15,7 @@ from typing import Optional
 
 
 from config import load_config as _load_config
+from core.llm_client import call_llm_text as _call_llm_text
 
 
 def _run_script(file_path: str, timeout: int = 15) -> tuple[bool, str, str]:
@@ -78,9 +79,6 @@ def _call_llm_for_fix(file_content: str, error_info: dict, stderr: str, config: 
     Sends the broken file + real error to the LLM and asks for a corrected
     full-file replacement. Returns the fixed code, or None on failure.
     """
-    import requests
-
-    url   = config.get("llm_url", "http://localhost:11434").rstrip("/")
     model = config.get("llm_model", "qwen2.5:3b")
 
     prompt = f"""You are an expert Python debugger. A script failed with a real error.
@@ -100,17 +98,12 @@ CURRENT FILE CONTENT:
 Fix the bug. Output ONLY the complete corrected Python file content, with no explanation, no markdown code fences, no commentary — just the raw corrected source code that should replace the file entirely."""
 
     try:
-        payload = {
-            "model": model,
-            "stream": False,
-            "messages": [
-                {"role": "system", "content": "You are a precise code-fixing assistant. Output only raw code, never markdown fences or explanations."},
-                {"role": "user", "content": prompt},
-            ],
-        }
-        resp = requests.post(f"{url}/api/chat", json=payload, timeout=60)
-        resp.raise_for_status()
-        fixed_code = resp.json().get("message", {}).get("content", "").strip()
+        fixed_code = _call_llm_text(
+            prompt,
+            system="You are a precise code-fixing assistant. Output only raw code, never markdown fences or explanations.",
+            model=model,
+            timeout=60,
+        )
 
         # Strip markdown fences if the model added them anyway
         fixed_code = re.sub(r"^```(?:python)?\n", "", fixed_code)

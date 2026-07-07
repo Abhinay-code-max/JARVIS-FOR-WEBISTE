@@ -12,14 +12,10 @@ Simple flow:
 """
 
 from __future__ import annotations
-import base64
 import io
-import json
 import re
 from pathlib import Path
 from typing import Optional
-
-import requests
 
 try:
     import mss
@@ -42,6 +38,7 @@ except ImportError:
 
 
 from config import load_config as _load_config, BASE_DIR
+from core.llm_client import call_llm_text as _llm_text, call_llm_vision as _llm_vision
 
 
 def _capture_screen() -> bytes:
@@ -154,28 +151,11 @@ def _extract_filename_from_title(title: str) -> str:
 
 
 def _call_vision_model(image_bytes: bytes, prompt: str, config: dict) -> str:
-    url   = config.get("llm_url", "http://localhost:11434").rstrip("/")
     model = config.get("vision_model") or "qwen2.5vl:7b"
-
-    b64 = base64.b64encode(image_bytes).decode("ascii")
-    payload = {
-        "model": model,
-        "stream": False,
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt,
-                "images": [b64],
-            }
-        ],
-    }
-    resp = requests.post(f"{url}/api/chat", json=payload, timeout=60)
-    resp.raise_for_status()
-    return (resp.json().get("message", {}).get("content") or "").strip()
+    return _llm_vision(prompt, image_bytes, model=model, timeout=60).strip()
 
 
 def _call_llm_to_fix(file_content: str, bug_description: str, config: dict) -> Optional[str]:
-    url   = config.get("llm_url", "http://localhost:11434").rstrip("/")
     model = config.get("llm_model", "qwen2.5:3b")
 
     prompt = f"""Fix this Python file based on the identified bug.
@@ -190,17 +170,12 @@ CURRENT FILE:
 Output ONLY the complete corrected file content. No markdown fences, no explanation — just the raw fixed source code."""
 
     try:
-        payload = {
-            "model": model,
-            "stream": False,
-            "messages": [
-                {"role": "system", "content": "You fix code bugs. Output only raw corrected code, nothing else."},
-                {"role": "user", "content": prompt},
-            ],
-        }
-        resp = requests.post(f"{url}/api/chat", json=payload, timeout=60)
-        resp.raise_for_status()
-        fixed = resp.json().get("message", {}).get("content", "").strip()
+        fixed = _llm_text(
+            prompt,
+            system="You fix code bugs. Output only raw corrected code, nothing else.",
+            model=model,
+            timeout=60,
+        ).strip()
         fixed = re.sub(r"^```(?:python)?\n", "", fixed)
         fixed = re.sub(r"\n```$", "", fixed)
         return fixed.strip()

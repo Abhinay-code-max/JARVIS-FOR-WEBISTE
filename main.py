@@ -233,8 +233,10 @@ TOOL_DECLARATIONS = [
     {
         "name": "screen_process",
         "description": (
-            "Captures and analyzes the screen or webcam. "
-            "MUST be called when user asks what is on screen, what you see, analyze screen, etc."
+            "Captures a NEW live screenshot or webcam photo right now and analyzes it. "
+            "MUST be called when user asks what is on screen, what you see, analyze screen, etc. "
+            "Do NOT use this if the user has an uploaded/dropped file (see [UPLOADED FILE] "
+            "in the system context) — use file_processor for that instead."
         ),
         "parameters": {
             "type": "OBJECT",
@@ -394,7 +396,13 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "file_processor",
-        "description": "Processes uploaded files: images, PDFs, CSV, audio, video.",
+        "description": (
+            "Processes an already-uploaded/dropped file on disk: images, PDFs, CSV, "
+            "audio, video, etc. Use this whenever the user refers to a file they "
+            "uploaded/dropped, or asks \"what is this\"/\"describe this\" while a file "
+            "is loaded (see [UPLOADED FILE] in the system context) — NOT screen_process, "
+            "which captures a brand-new live screenshot/webcam image instead."
+        ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
@@ -596,9 +604,26 @@ class JarvisXL:
             f"{now.strftime('%A, %B %d, %Y — %I:%M %p')}\n"
         )
 
+        # Persistent reminder while a file is loaded — the one-time
+        # [FILE_UPLOADED] chat message only appears once at drop time, so
+        # without this a later "what is this?" a few turns on has no signal
+        # telling the model a file (not the live screen/webcam) is the subject.
+        file_ctx = ""
+        cur_file = self.ui.current_file
+        if cur_file:
+            file_ctx = (
+                f"[UPLOADED FILE]\n"
+                f"The user has a file loaded and ready: '{Path(cur_file).name}'. "
+                f"If they ask about \"this\", \"the file\", what they uploaded, or its "
+                f"content, call file_processor — do NOT call screen_process, which "
+                f"captures a brand-new live screen/webcam image instead of the "
+                f"uploaded file.\n"
+            )
+
         parts = [sys_p]
         if user_ctx:  parts.append(user_ctx)
         if mem_str:   parts.append(mem_str)
+        if file_ctx:  parts.append(file_ctx)
         parts.append(time_ctx)
         return "\n\n".join(parts)
 

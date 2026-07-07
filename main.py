@@ -66,6 +66,7 @@ import queue
 import re
 import sys
 import threading
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -556,6 +557,21 @@ class JarvisXL:
         self._user_confidence: float     = 0.0
         self._last_voice_buf: np.ndarray | None = None  # most recent utterance audio
 
+        # Duplicate-command guard — split producer/consumer state.
+        # Producer-side (_last_produced_*) is written by whichever of the 4
+        # entry points (typed text, whisper, vosk, deepgram) is calling in,
+        # each on its own thread, so it's protected by _produce_lock.
+        # Consumer-side (_last_command_*) is only ever touched by the single
+        # _text_command_loop thread, so it needs no lock. Keeping these two
+        # separate (instead of one shared pair checked from both sides)
+        # avoids the producer and consumer racing over the same fields.
+        self._produce_lock:       threading.Lock = threading.Lock()
+        self._last_produced_text: str   = ""
+        self._last_produced_time: float = 0.0
+        self._last_command_text:  str   = ""
+        self._last_command_time:  float = 0.0
+        self._dedup_window_sec:   float = 2.5
+
         self.ui.on_text_command = self._on_text_command
 
     # ── System prompt ─────────────────────────────────────────────────────────
@@ -619,8 +635,26 @@ class JarvisXL:
         self.speak(f"{tool_name} encountered an error.")
 
     # ── Text command entry ────────────────────────────────────────────────────
-    def _on_text_command(self, text: str) -> None:
+    def _enqueue_command(self, text: str) -> None:
+        """Single entry point for all 4 producers (typed text, whisper, vosk,
+        deepgram). Dedupes at the point of production so a near-duplicate
+        from the same source (e.g. Deepgram splitting one utterance into two
+        final transcripts) never reaches the queue at all."""
+        normalized = text.strip().lower()
+        if not normalized:
+            return
+        with self._produce_lock:
+            now = time.time()
+            if (normalized == self._last_produced_text
+                    and (now - self._last_produced_time) < self._dedup_window_sec):
+                print(f"[Dedup] Ignored duplicate at producer: {text!r}")
+                return
+            self._last_produced_text = normalized
+            self._last_produced_time = now
         self._text_queue.put(text)
+
+    def _on_text_command(self, text: str) -> None:
+        self._enqueue_command(text)
 
     # ── Recognition tools ─────────────────────────────────────────────────────
     def _do_identify_user(self, method: str = "both") -> str:
@@ -912,7 +946,7 @@ class JarvisXL:
                 self._last_voice_buf = utterance   # store for voice-ID
                 t = self._stt.transcribe(utterance)
                 if t and t.strip():
-                    self._text_queue.put(t.strip())
+                    self._enqueue_command(t.strip())
 
         with sd.InputStream(samplerate=SAMPLE_RATE_IN, channels=CHANNELS,
                             blocksize=BLOCK_SIZE, dtype="float32", callback=_cb):
@@ -927,7 +961,7 @@ class JarvisXL:
         def _on_transcript(text: str) -> None:
             if self.ui.muted: return
             if text and text.strip():
-                self._text_queue.put(text.strip())
+                self._enqueue_command(text.strip())
 
         streamer = DeepgramStreamingSTT(language=stt_language, on_transcript=_on_transcript)
         streamer.start()
@@ -947,7 +981,7 @@ class JarvisXL:
                 self._last_voice_buf = utterance
                 t = self._stt.transcribe(utterance)
                 if t and t.strip():
-                    self._text_queue.put(t.strip())
+                    self._enqueue_command(t.strip())
 
         with sd.InputStream(samplerate=SAMPLE_RATE_IN, channels=CHANNELS,
                             blocksize=BLOCK_SIZE, dtype="float32", callback=_cb):
@@ -958,8 +992,20 @@ class JarvisXL:
         while True:
             try:
                 text = self._text_queue.get(timeout=0.5)
-                if text.strip():
-                    self._process_message(text)
+                if not text.strip():
+                    continue
+
+                normalized = text.strip().lower()
+                now        = time.time()
+
+                if (normalized == self._last_command_text
+                        and (now - self._last_command_time) < self._dedup_window_sec):
+                    print(f"[Dedup] Skipped duplicate at consumer: {text!r}")
+                    continue
+
+                self._last_command_text = normalized
+                self._last_command_time = now
+                self._process_message(text)
             except queue.Empty:
                 pass
 

@@ -55,9 +55,13 @@ def _build_sandbox() -> dict:
 
     if _OS == "Windows":
         try:
-            import ctypes
             import winreg
-            sandbox["ctypes"] = ctypes
+            # NOTE: ctypes is deliberately NOT exposed here. It's a raw FFI
+            # into the entire C runtime and any loadable DLL — there is no
+            # "read-only" subset of it; ctypes.CDLL("msvcrt").system(...)
+            # alone is equivalent to full shell access, regardless of what
+            # the prompt tells the model. Only narrow, genuinely read-only
+            # wrappers belong in this sandbox (see winreg below).
             sandbox["winreg"] = type("winreg", (), {
                 # Sadece okuma
                 "OpenKey":      winreg.OpenKey,
@@ -97,7 +101,7 @@ def _ask_gemini_for_desktop_action(task: str) -> str:
     desktop     = str(_get_desktop())
     os_specific = ""
     if _OS == "Windows":
-        os_specific = "- ctypes (Windows API calls, read-only)\n- winreg (registry READ only)"
+        os_specific = "- winreg (registry READ only) — ctypes is NOT available"
     else:
         os_specific = "- subprocess is NOT available; use pyautogui or Path only"
 

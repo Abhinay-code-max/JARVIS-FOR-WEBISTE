@@ -82,6 +82,7 @@ from recognition.voice_id import VoiceIdentifier
 from recognition.wake_word import WakeWordDetector
 
 from core.tool_dispatch import TOOL_DISPATCH
+from core.confirm import CONFIRM
 from config import load_config, BASE_DIR
 
 # ── Paths ────────────────────────────────────────────────────────────────────
@@ -666,6 +667,14 @@ class JarvisXL:
         normalized = text.strip().lower()
         if not normalized:
             return
+
+        # A code-execution confirmation gate (core/confirm.py) is waiting
+        # on the next utterance as its yes/no answer — route it there
+        # instead of treating it as a new independent command.
+        if CONFIRM.is_pending():
+            CONFIRM.answer(text)
+            return
+
         with self._produce_lock:
             now = time.time()
             if (normalized == self._last_produced_text

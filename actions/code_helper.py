@@ -153,7 +153,7 @@ def _fix_code(code: str, error_output: str, description: str) -> str:
     return _clean_code(_llm(prompt, system=system))
 
 
-def _run_file(path: Path, args: list, timeout: int) -> str:
+def _run_file(path: Path, args: list, timeout: int, player=None, speak=None) -> str:
     interpreters = {
         ".py":  [sys.executable],
         ".js":  ["node"],
@@ -166,6 +166,10 @@ def _run_file(path: Path, args: list, timeout: int) -> str:
     interp = interpreters.get(path.suffix.lower())
     if not interp:
         return f"No interpreter for {path.suffix}."
+
+    from core.confirm import CONFIRM
+    if not CONFIRM.request(player, f"I'm about to run {path.name} with {interp[0]}", speak=speak):
+        return f"Cancelled — did not run {path.name}."
 
     try:
         result = subprocess.run(
@@ -212,7 +216,7 @@ def _build(description, language, output_path, args, timeout, speak=None, player
         if player:
             player.write_log(f"[Code] Attempt {attempt}...")
 
-        last_output = _run_file(path, args, timeout)
+        last_output = _run_file(path, args, timeout, player=player, speak=speak)
 
         if not _has_error(last_output):
             msg = (
@@ -306,7 +310,7 @@ def _explain_action(file_path, code, player) -> str:
         return f"Could not explain code: {e}"
 
 
-def _run_action(file_path, args, timeout, player) -> str:
+def _run_action(file_path, args, timeout, player, speak=None) -> str:
     if not file_path:
         return "Please provide a file path to run, sir."
     p = Path(file_path)
@@ -314,7 +318,7 @@ def _run_action(file_path, args, timeout, player) -> str:
         return f"File not found: {file_path}"
     if player:
         player.write_log(f"[Code] Running {p.name}...")
-    return _run_file(p, args, timeout)
+    return _run_file(p, args, timeout, player=player, speak=speak)
 
 
 def _optimize_action(file_path, code, language, output_path, player) -> str:
@@ -475,7 +479,7 @@ def code_helper(
         return _explain_action(file_path, code, player)
 
     elif action == "run":
-        return _run_action(file_path, args, timeout, player)
+        return _run_action(file_path, args, timeout, player, speak=speak)
 
     elif action == "build":
         return _build(description, language, output_path, args, timeout, speak, player)

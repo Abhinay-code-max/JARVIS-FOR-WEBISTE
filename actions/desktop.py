@@ -74,7 +74,7 @@ def _build_sandbox() -> dict:
     return sandbox
 
 
-def _execute_generated_code(code: str, player=None) -> str:
+def _execute_generated_code(code: str, player=None, speak=None) -> str:
     if not code or code.strip() == "UNSAFE":
         return "This action cannot be performed safely."
 
@@ -82,6 +82,11 @@ def _execute_generated_code(code: str, player=None) -> str:
     if code.startswith("```"):
         lines = code.split("\n")
         code  = "\n".join(lines[1:-1]).strip()
+
+    from core.confirm import CONFIRM
+    preview = code if len(code) <= 200 else code[:200] + "..."
+    if not CONFIRM.request(player, f"I'm about to run this generated code:\n{preview}", speak=speak):
+        return "Cancelled — did not run the generated code."
 
     sandbox      = _build_sandbox()
     output_lines = []
@@ -390,6 +395,7 @@ def desktop_control(
     response=None,
     player=None,
     session_memory=None,
+    speak=None,
 ) -> str:
     """
     parameters:
@@ -442,12 +448,12 @@ def desktop_control(
                 player.write_log("[Desktop] Generating action...")
 
             code = _ask_gemini_for_desktop_action(actual_task)
-            return _execute_generated_code(code, player=player)
+            return _execute_generated_code(code, player=player, speak=speak)
 
         else:
             if action:
                 code = _ask_gemini_for_desktop_action(action)
-                return _execute_generated_code(code, player=player)
+                return _execute_generated_code(code, player=player, speak=speak)
             return "No action or task specified."
 
     except Exception as e:

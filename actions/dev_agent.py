@@ -168,7 +168,7 @@ def _write_file(
     except Exception as e:
         raise
 
-def _install_dependencies(dependencies: list[str], project_dir: Path) -> str:
+def _install_dependencies(dependencies: list[str], project_dir: Path, player=None, speak=None) -> str:
     if not dependencies:
         return "No external dependencies."
 
@@ -186,6 +186,10 @@ def _install_dependencies(dependencies: list[str], project_dir: Path) -> str:
 
     if not to_install:
         return f"All dependencies already installed: {', '.join(dependencies)}"
+
+    from core.confirm import CONFIRM
+    if not CONFIRM.request(player, f"I need to pip install these packages: {', '.join(to_install)}", speak=speak):
+        return "Cancelled — did not install dependencies."
 
     print(f"[DevAgent] 📦 Installing: {to_install}")
     try:
@@ -233,7 +237,11 @@ def _open_vscode(project_dir: Path) -> bool:
             continue
     return False
 
-def _run_project(run_command: str, project_dir: Path, timeout: int = 30) -> str:
+def _run_project(run_command: str, project_dir: Path, timeout: int = 30, player=None, speak=None) -> str:
+    from core.confirm import CONFIRM
+    if not CONFIRM.request(player, f"I'm about to run: {run_command}", speak=speak):
+        return "Cancelled — did not run the project."
+
     print(f"[DevAgent] 🚀 Running: {run_command}")
     try:
         parts = run_command.split()
@@ -266,7 +274,7 @@ def _run_project(run_command: str, project_dir: Path, timeout: int = 30) -> str:
     except Exception as e:
         return f"Run error: {e}"
 
-def _try_auto_install(error_output: str, project_dir: Path) -> bool:
+def _try_auto_install(error_output: str, project_dir: Path, player=None, speak=None) -> bool:
     """ModuleNotFoundError varsa eksik paketi otomatik kurmaya çalışır."""
     pattern = re.compile(
         r"No module named ['\"]([a-zA-Z0-9_\-\.]+)['\"]", re.IGNORECASE
@@ -276,6 +284,11 @@ def _try_auto_install(error_output: str, project_dir: Path) -> bool:
         return False
 
     pkg = match.group(1).replace("_", "-").split(".")[0]
+
+    from core.confirm import CONFIRM
+    if not CONFIRM.request(player, f"Missing package detected: {pkg}. I'd like to pip install it", speak=speak):
+        return False
+
     print(f"[DevAgent] 🔧 Auto-installing missing package: {pkg}")
     try:
         result = subprocess.run(
@@ -433,7 +446,7 @@ def _build_project(
         return msg
 
     if dependencies:
-        install_result = _install_dependencies(dependencies, project_dir)
+        install_result = _install_dependencies(dependencies, project_dir, player=player, speak=speak)
         log(install_result)
 
     _open_vscode(project_dir)
@@ -443,7 +456,7 @@ def _build_project(
 
     for attempt in range(1, MAX_FIX_ATTEMPTS + 1):
         log(f"Running project (attempt {attempt}/{MAX_FIX_ATTEMPTS})...")
-        last_output = _run_project(run_command, project_dir, timeout)
+        last_output = _run_project(run_command, project_dir, timeout, player=player, speak=speak)
         log(f"Output preview: {last_output[:150]}")
 
         if not _has_error(last_output, run_command):
@@ -460,7 +473,7 @@ def _build_project(
 
         error_type = _classify_error(last_output)
         if error_type == "dependency_error" and auto_installs < 3:
-            installed = _try_auto_install(last_output, project_dir)
+            installed = _try_auto_install(last_output, project_dir, player=player, speak=speak)
             if installed:
                 auto_installs += 1
                 log("Missing dependency installed, retrying...")

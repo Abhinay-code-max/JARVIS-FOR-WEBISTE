@@ -67,7 +67,7 @@ def _computer_settings(parameters, player, speak):
 
 def _desktop_control(parameters, player, speak):
     from actions.desktop import desktop_control
-    return desktop_control(parameters=parameters, player=player) or "Done."
+    return desktop_control(parameters=parameters, player=player, speak=speak) or "Done."
 
 
 def _code_helper(parameters, player, speak):

@@ -71,6 +71,19 @@ class VoskSTT:
         self._rec = KaldiRecognizer(model, 16000)
         print("[STT] Vosk ready.")
 
+    def transcribe(self, audio: np.ndarray) -> str:
+        """Transcribe a float32 mono 16 kHz numpy array (one VAD-segmented utterance).
+
+        Matches WhisperSTT.transcribe's signature so main.py's _listen_vosk can call
+        self._stt.transcribe(utterance) the same way regardless of engine.
+        """
+        self._rec.Reset()  # drop acoustic state left over from the previous utterance
+        pcm16 = np.clip(audio, -1.0, 1.0)
+        pcm16 = (pcm16 * 32767.0).astype(np.int16).tobytes()
+        self._rec.AcceptWaveform(pcm16)
+        result = json.loads(self._rec.FinalResult())
+        return result.get("text", "").strip()
+
     def process_chunk(self, audio_bytes: bytes) -> tuple[str, bool]:
         """Feed raw int16 LE PCM bytes. Returns (text, is_final)."""
         if self._rec.AcceptWaveform(audio_bytes):

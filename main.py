@@ -328,6 +328,29 @@ TOOL_DECLARATIONS = [
         }
     },
     {
+        "name": "agent_task",
+        "description": (
+            "Run a complex multi-step goal autonomously in the background. "
+            "Use ONLY when the goal needs 3 or more different tools chained "
+            "together. Returns immediately; the result is announced when the "
+            "task finishes. Do NOT use this if a single tool can do the job."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "goal": {
+                    "type": "STRING",
+                    "description": "The full multi-step goal, stated in one sentence"
+                },
+                "priority": {
+                    "type": "STRING",
+                    "description": "One of: high, normal, low. Default normal."
+                }
+            },
+            "required": ["goal"]
+        }
+    },
+    {
         "name": "computer_control",
         "description": "Direct mouse/keyboard control: click, type, scroll, hotkeys.",
         "parameters": {
@@ -762,6 +785,35 @@ class JarvisXL:
             if not self.ui.muted:
                 self.ui.set_state("LISTENING")
             return result
+
+        if name == "agent_task":
+            from agent.task_queue import get_queue, TaskPriority
+            goal = args.get("goal", "").strip()
+            if not goal:
+                return "No goal was provided for the background task."
+            prio_map = {
+                "high":   TaskPriority.HIGH,
+                "normal": TaskPriority.NORMAL,
+                "low":    TaskPriority.LOW,
+            }
+            priority = prio_map.get(str(args.get("priority", "normal")).lower(),
+                                    TaskPriority.NORMAL)
+
+            def _on_done(task_id: str, result: str) -> None:
+                self.ui.write_log(f"AGENT: [{task_id}] complete")
+                if result:
+                    self.speak(str(result))
+
+            task_id = get_queue().submit(
+                goal        = goal,
+                priority    = priority,
+                speak       = self.speak,
+                on_complete = _on_done,
+            )
+            self.ui.write_log(f"AGENT: [{task_id}] started — {goal[:60]}")
+            if not self.ui.muted:
+                self.ui.set_state("LISTENING")
+            return f"Working on that in the background, sir. Task {task_id}."
 
         result = "Done."
         try:

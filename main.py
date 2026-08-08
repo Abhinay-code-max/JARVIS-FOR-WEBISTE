@@ -502,11 +502,17 @@ def _load_system_prompt() -> str:
 
 # ── Voice Activity Detection ──────────────────────────────────────────────────
 class _VADBuffer:
-    def __init__(self, sample_rate=16_000, silence_sec=0.7,
+    def __init__(self, sample_rate=16_000, silence_sec=5.0,
+                 barge_in_speech_sec=0.18,
                  speech_thresh=0.008, silence_thresh=0.004,
                  min_speech_sec=0.3, max_speech_sec=30.0):
         self._sr           = sample_rate
         self._sil_n        = int(silence_sec * sample_rate)
+        # Shorter threshold used ONLY to confirm a barge-in (sustained
+        # speech-level RMS while JARVIS is talking) — kept separate from
+        # silence_sec so lengthening end-of-utterance patience doesn't also
+        # make barge-in feel sluggish. Not used by process() below.
+        self._barge_in_speech_sec = barge_in_speech_sec
         self._speech_thresh = speech_thresh
         self._sil_thresh   = silence_thresh
         self._min_n        = int(min_speech_sec * sample_rate)
@@ -514,13 +520,15 @@ class _VADBuffer:
         self._buf:         list = []
         self._in_spch      = False
         self._sil_cnt      = 0
+        self._nudge_shown  = False
 
     def process(self, chunk: np.ndarray):
         rms     = float(np.sqrt(np.mean(chunk ** 2)))
         total_n = sum(len(c) for c in self._buf)
         if rms > self._speech_thresh:
-            self._in_spch = True
-            self._sil_cnt = 0
+            self._in_spch     = True
+            self._sil_cnt     = 0
+            self._nudge_shown = False
             self._buf.append(chunk.copy())
         elif self._in_spch:
             self._buf.append(chunk.copy())
@@ -531,9 +539,54 @@ class _VADBuffer:
                 self._buf     = []
                 self._in_spch = False
                 self._sil_cnt = 0
+                self._nudge_shown = False
                 if len(audio) >= self._min_n:
                     return audio
         return None
+
+    def should_nudge(self, nudge_sec: float = 2.0) -> bool:
+        """Fires once per utterance, ~nudge_sec into a mid-utterance pause —
+        lets the caller show a 'still listening' UI cue well before the
+        full silence_sec timeout ends the utterance."""
+        if not self._in_spch or self._nudge_shown:
+            return False
+        if self._sil_cnt >= int(nudge_sec * self._sr):
+            self._nudge_shown = True
+            return True
+        return False
+
+
+class _BargeInDetector:
+    """Watches raw mic RMS while JARVIS is speaking and fires once
+    ~confirm_sec of continuous speech-level RMS is seen — long enough to
+    tell a real interruption apart from a single loud click, but short
+    enough that barge-in still feels immediate. Buffers the hot audio so
+    it can be handed to a fresh _VADBuffer instead of being discarded."""
+
+    def __init__(self, speech_thresh: float = 0.008, confirm_sec: float = 0.18,
+                 sample_rate: int = 16_000):
+        self._speech_thresh = speech_thresh
+        self._confirm_n     = int(confirm_sec * sample_rate)
+        self._hot_n         = 0
+        self._hot_chunks: list = []
+
+    def reset(self) -> None:
+        self._hot_n      = 0
+        self._hot_chunks = []
+
+    def check(self, chunk: np.ndarray) -> bool:
+        rms = float(np.sqrt(np.mean(chunk ** 2)))
+        if rms <= self._speech_thresh:
+            self.reset()
+            return False
+        self._hot_n += len(chunk)
+        self._hot_chunks.append(chunk.copy())
+        return self._hot_n >= self._confirm_n
+
+    def drain(self) -> np.ndarray:
+        audio = np.concatenate(self._hot_chunks) if self._hot_chunks else np.empty(0, dtype=np.float32)
+        self.reset()
+        return audio
 
 
 # ── Main assistant ────────────────────────────────────────────────────────────
@@ -565,6 +618,11 @@ class JarvisXL:
         # phantom user command.
         self._speech_end_time: float = 0.0
         self._echo_grace_sec:  float = 0.6
+        # Set by _handle_barge_in() and consumed by _tts_worker's finally
+        # block — without this, the worker's normal "TTS just ended, arm
+        # the grace period" cleanup would immediately re-gate the mic right
+        # after a barge-in, undoing the whole point of interrupting.
+        self._interrupted_by_barge_in: bool = False
         self._text_queue:      queue.Queue = queue.Queue()
         self._tts_queue:       queue.Queue = queue.Queue()
         self._conversation:    list[dict]  = []
@@ -658,8 +716,15 @@ class JarvisXL:
                 self._tts_queue.task_done()
                 if self._tts_queue.empty():
                     with self._speaking_lock:
-                        self._speaking         = False
-                        self._speech_end_time  = time.time() + self._echo_grace_sec
+                        was_barge_in = self._interrupted_by_barge_in
+                        self._interrupted_by_barge_in = False
+                        self._speaking = False
+                        if not was_barge_in:
+                            self._speech_end_time = time.time() + self._echo_grace_sec
+                        # else: a barge-in already zeroed _speech_end_time —
+                        # don't re-arm the grace window right on top of it,
+                        # that would re-gate the mic immediately after the
+                        # interruption we just made room for.
                     if not self.ui.muted:
                         self.ui.set_state("LISTENING")
 
@@ -680,6 +745,36 @@ class JarvisXL:
     def speak_error(self, tool_name: str, error) -> None:
         self.ui.write_log(f"ERR: {tool_name} — {str(error)[:120]}")
         self.speak(f"{tool_name} encountered an error.")
+
+    # ── Barge-in ───────────────────────────────────────────────────────────────
+    def _handle_barge_in(self) -> None:
+        """Called the moment sustained speech-level audio is detected while
+        JARVIS is talking. Cuts playback short and flips state so the words
+        that triggered the interrupt are captured as the start of a new
+        utterance instead of being dropped by the echo gate."""
+        if self._tts:
+            try:
+                self._tts.stop()
+            except Exception as e:
+                print(f"[BargeIn] tts.stop() failed: {e}")
+
+        # Drop any sentences still queued from the interrupted response —
+        # otherwise the TTS worker would just move on to the next one right
+        # after stop() cuts the current chunk off.
+        while True:
+            try:
+                self._tts_queue.get_nowait()
+                self._tts_queue.task_done()
+            except queue.Empty:
+                break
+
+        with self._speaking_lock:
+            self._speaking                 = False
+            self._speech_end_time          = 0.0   # don't leave the tail grace window active
+            self._interrupted_by_barge_in  = True
+
+        if not self.ui.muted:
+            self.ui.set_state("LISTENING")
 
     # ── Text command entry ────────────────────────────────────────────────────
     def _enqueue_command(self, text: str) -> None:
@@ -953,24 +1048,83 @@ class JarvisXL:
         return [summary_msg] + keep
 
     # ── Listen loops ──────────────────────────────────────────────────────────
-    def _listen_whisper(self) -> None:
-        vad = _VADBuffer()
+    def _listen_vad_buffered(self) -> None:
+        """Shared mic loop for VAD-buffered STT engines (whisper/vosk): a
+        local _VADBuffer decides utterance boundaries, then self._stt
+        transcribes the finished chunk. Mic stays live while JARVIS talks so
+        barge-in can be detected (see _BargeInDetector)."""
+        vad   = [_VADBuffer()]   # boxed so the callback can swap in a fresh buffer on barge-in
+        barge = _BargeInDetector(speech_thresh=vad[0]._speech_thresh,
+                                  confirm_sec=vad[0]._barge_in_speech_sec,
+                                  sample_rate=SAMPLE_RATE_IN)
+        nudged = [False]
+
+        def _transcribe_and_enqueue(utterance: np.ndarray) -> None:
+            self._last_voice_buf = utterance   # store for voice-ID
+            t = self._stt.transcribe(utterance)
+            if t and t.strip():
+                self._enqueue_command(t.strip())
+
         def _cb(indata, frames, time_info, status):
-            if self.ui.muted or self._echo_gated(): return
+            if self.ui.muted:
+                return
             audio = indata[:, 0].astype(np.float32)
-            utterance = vad.process(audio)
+
+            with self._speaking_lock:
+                speaking_now = self._speaking
+
+            if speaking_now:
+                # Mic stays live while JARVIS talks — watch for a real
+                # interruption instead of gating the audio off entirely.
+                if barge.check(audio):
+                    trigger_audio = barge.drain()
+                    self._handle_barge_in()
+                    vad[0] = _VADBuffer()
+                    nudged[0] = False
+                    utterance = vad[0].process(trigger_audio)
+                    if utterance is not None:
+                        _transcribe_and_enqueue(utterance)
+                return
+            barge.reset()
+
+            # JARVIS isn't actively speaking — the short post-TTS grace
+            # window still applies here (avoids speaker bleed right at the
+            # tail end of a normal, non-interrupted response).
+            if self._echo_gated():
+                return
+
+            utterance = vad[0].process(audio)
+            if vad[0].should_nudge():
+                nudged[0] = True
+                if not self.ui.muted:
+                    self.ui.set_state("THINKING")   # UI-only "still listening" cue
+            elif nudged[0] and vad[0]._in_spch and vad[0]._sil_cnt == 0:
+                # user resumed talking right after the nudge — don't leave
+                # the UI looking like it's processing while they're still mid-sentence
+                nudged[0] = False
+                if not self.ui.muted:
+                    self.ui.set_state("LISTENING")
+
             if utterance is not None:
-                self._last_voice_buf = utterance   # store for voice-ID
-                t = self._stt.transcribe(utterance)
-                if t and t.strip():
-                    self._enqueue_command(t.strip())
+                nudged[0] = False
+                _transcribe_and_enqueue(utterance)
 
         with sd.InputStream(samplerate=SAMPLE_RATE_IN, channels=CHANNELS,
                             blocksize=BLOCK_SIZE, dtype="float32", callback=_cb):
             while True:
                 threading.Event().wait(1)
 
+    def _listen_whisper(self) -> None:
+        self._listen_vad_buffered()
+
     def _listen_deepgram(self) -> None:
+        # Deepgram is a streaming API, not VAD-buffered like whisper/vosk:
+        # raw audio is forwarded to Deepgram's WebSocket continuously (that
+        # part is unchanged), and Deepgram's own server-side endpointing
+        # decides utterance boundaries — there's no local _VADBuffer here to
+        # swap out, so barge-in and the "still listening" nudge are driven
+        # off a lightweight local RMS watch inside DeepgramStreamingSTT
+        # itself, in parallel with (not instead of) the transcript stream.
         from core.stt_deepgram import DeepgramStreamingSTT
 
         stt_language = self._config.get("stt_language", "auto")
@@ -980,7 +1134,33 @@ class JarvisXL:
             if text and text.strip():
                 self._enqueue_command(text.strip())
 
-        streamer = DeepgramStreamingSTT(language=stt_language, on_transcript=_on_transcript)
+        def _is_speaking() -> bool:
+            with self._speaking_lock:
+                return self._speaking
+
+        def _is_muted() -> bool:
+            return self.ui.muted
+
+        def _on_barge_in() -> None:
+            # The interrupting audio itself isn't lost: Deepgram already had
+            # it (the mic is streamed to Deepgram continuously, never
+            # gated), so the transcript for it just needs to not be dropped
+            # by _on_transcript's echo gate — which _handle_barge_in ensures
+            # by flipping self._speaking off immediately.
+            self._handle_barge_in()
+
+        def _on_silence_nudge() -> None:
+            if not self.ui.muted:
+                self.ui.set_state("THINKING")   # UI-only "still listening" cue
+
+        streamer = DeepgramStreamingSTT(
+            language         = stt_language,
+            on_transcript    = _on_transcript,
+            is_speaking      = _is_speaking,
+            is_muted         = _is_muted,
+            on_barge_in      = _on_barge_in,
+            on_silence_nudge = _on_silence_nudge,
+        )
         streamer.start()
         try:
             while True:
@@ -989,21 +1169,7 @@ class JarvisXL:
             streamer.stop()
 
     def _listen_vosk(self) -> None:
-        vad = _VADBuffer()
-        def _cb(indata, frames, time_info, status):
-            if self.ui.muted or self._echo_gated(): return
-            audio = indata[:, 0].astype(np.float32)
-            utterance = vad.process(audio)
-            if utterance is not None:
-                self._last_voice_buf = utterance
-                t = self._stt.transcribe(utterance)
-                if t and t.strip():
-                    self._enqueue_command(t.strip())
-
-        with sd.InputStream(samplerate=SAMPLE_RATE_IN, channels=CHANNELS,
-                            blocksize=BLOCK_SIZE, dtype="float32", callback=_cb):
-            while True:
-                threading.Event().wait(1)
+        self._listen_vad_buffered()
 
     def _text_command_loop(self) -> None:
         while True:

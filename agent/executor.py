@@ -3,6 +3,7 @@ MARK XL — Agent Executor
 Replaces google.generativeai with local Ollama via core.llm_client.
 """
 import json
+import logging
 import re
 import sys
 import threading
@@ -17,15 +18,22 @@ from agent.planner       import create_plan, replan
 from agent.error_handler import analyze_error, generate_fix, ErrorDecision
 from core.llm_client     import call_llm_text
 from core.tool_dispatch  import TOOL_DISPATCH
-from core.db             import get_conn
+from core.db             import log_task_event
 from config              import BASE_DIR
+
+_log = logging.getLogger("jarvis.executor")
 
 
 # ---------------------------------------------------------------------------
 # Code generation helper (replaces _run_generated_code with Gemini)
 # ---------------------------------------------------------------------------
 
-def _run_generated_code(description: str, speak: Callable | None = None) -> str:
+def _run_generated_code(
+    description: str,
+    speak:       Callable | None = None,
+    task_id:     str | None      = None,
+    step_num                     = None,
+) -> str:
     if speak:
         speak("Writing custom code for this task, sir.")
 
@@ -60,7 +68,10 @@ def _run_generated_code(description: str, speak: Callable | None = None) -> str:
     prompt = f"Write Python code to accomplish this task:\n\n{description}"
 
     try:
-        code = call_llm_text(prompt, system=system)
+        code = call_llm_text(
+            prompt, system=system,
+            task_id=task_id, step_num=step_num, purpose="generate code",
+        )
         code = re.sub(r"```(?:python)?", "", code).strip().rstrip("`").strip()
 
         with tempfile.NamedTemporaryFile(
@@ -69,7 +80,7 @@ def _run_generated_code(description: str, speak: Callable | None = None) -> str:
             f.write(code)
             tmp_path = f.name
 
-        print(f"[Executor] 🐍 Running generated code: {tmp_path}")
+        _log.debug("Running generated code: %s", tmp_path)
 
         result = subprocess.run(
             [sys.executable, tmp_path],
@@ -105,23 +116,24 @@ def _run_generated_code(description: str, speak: Callable | None = None) -> str:
 # Context injection
 # ---------------------------------------------------------------------------
 
-def _detect_language(text: str) -> str:
+def _detect_language(text: str, task_id: str | None = None, step_num=None) -> str:
     try:
         return call_llm_text(
             f"What language is this text written in? "
             f"Reply with ONLY the language name in English (e.g. Turkish, English, French).\n\n"
-            f"Text: {text[:200]}"
+            f"Text: {text[:200]}",
+            task_id=task_id, step_num=step_num, purpose="detect language",
         ).strip()
     except Exception:
         return "English"
 
 
-def _translate_to_goal_language(content: str, goal: str) -> str:
+def _translate_to_goal_language(content: str, goal: str, task_id: str | None = None, step_num=None) -> str:
     if not goal:
         return content
     try:
-        target_lang = _detect_language(goal)
-        print(f"[Executor] 🌐 Translating to: {target_lang}")
+        target_lang = _detect_language(goal, task_id=task_id, step_num=step_num)
+        _log.debug("Translating to: %s", target_lang)
         prompt = (
             f"You are a professional translator. "
             f"Translate the following text into {target_lang}.\n"
@@ -132,15 +144,18 @@ def _translate_to_goal_language(content: str, goal: str) -> str:
             f"- Output ONLY the translated text, nothing else\n\n"
             f"Text to translate:\n{content[:4000]}"
         )
-        translated = call_llm_text(prompt)
-        print(f"[Executor] ✅ Translation done ({target_lang})")
+        translated = call_llm_text(prompt, task_id=task_id, step_num=step_num, purpose="translate")
+        _log.debug("Translation done (%s)", target_lang)
         return translated
     except Exception as e:
-        print(f"[Executor] ⚠️ Translation failed: {e}")
+        _log.warning("Translation failed: %s", e)
         return content
 
 
-def _inject_context(params: dict, tool: str, step_results: dict, goal: str = "") -> dict:
+def _inject_context(
+    params: dict, tool: str, step_results: dict, goal: str = "",
+    task_id: str | None = None, step_num=None,
+) -> dict:
     if not step_results:
         return params
     params = dict(params)
@@ -153,41 +168,10 @@ def _inject_context(params: dict, tool: str, step_results: dict, goal: str = "")
             ]
             if all_results:
                 combined   = "\n\n---\n\n".join(all_results)
-                translated = _translate_to_goal_language(combined, goal)
+                translated = _translate_to_goal_language(combined, goal, task_id=task_id, step_num=step_num)
                 params["content"] = translated
-                print("[Executor] 💉 Injected + translated content")
+                _log.debug("Injected + translated content")
     return params
-
-
-# ---------------------------------------------------------------------------
-# Task event trace (task_events table — new capability, nothing to migrate)
-# ---------------------------------------------------------------------------
-
-def _log_task_event(
-    task_id:     str | None,
-    step_num,
-    tool:        str | None,
-    description: str,
-    status:      str,
-    detail:      str = "",
-) -> None:
-    """Insert one row into task_events. This executor's own per-task
-    worker thread already tolerates multi-second blocking LLM/network
-    calls, so a synchronous DB write here is safe. No-op if task_id is
-    None (e.g. execute() called without one) — a DB hiccup here must
-    never break the actual agent task, so failures are swallowed."""
-    if not task_id:
-        return
-    try:
-        conn = get_conn()
-        with conn:
-            conn.execute(
-                "INSERT INTO task_events (task_id, step_num, tool, description, status, detail, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (task_id, step_num, tool, description, status, detail[:500], time.time()),
-            )
-    except Exception as e:
-        print(f"[Executor] ⚠️ Could not log task event: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -211,12 +195,15 @@ _RECOVERY_NOT_EXECUTED_MARKERS = (
 )
 
 
-def _call_tool(tool: str, parameters: dict, speak: Callable | None) -> str:
+def _call_tool(
+    tool: str, parameters: dict, speak: Callable | None,
+    task_id: str | None = None, step_num=None,
+) -> str:
     if tool == "generated_code":
         description = parameters.get("description", "")
         if not description:
             raise ValueError("generated_code requires a 'description' parameter.")
-        return _run_generated_code(description, speak=speak)
+        return _run_generated_code(description, speak=speak, task_id=task_id, step_num=step_num)
 
     elif tool in TOOL_DISPATCH:
         # player=None: this executor runs without a live UI/session — the
@@ -247,12 +234,12 @@ class AgentExecutor:
         cancel_flag: threading.Event | None = None,
         task_id:     str | None             = None,
     ) -> str:
-        print(f"\n[Executor] 🎯 Goal: {goal}")
+        _log.info("Goal: %s", goal, extra={"task_id": task_id})
 
         replan_attempts = 0
         completed_steps: list = []
         step_results:    dict = {}
-        plan = create_plan(goal)
+        plan = create_plan(goal, task_id=task_id)
 
         while True:
             steps = plan.get("steps", [])
@@ -274,10 +261,10 @@ class AgentExecutor:
                 tool     = step.get("tool", "generated_code")
                 desc     = step.get("description", "")
                 params   = step.get("parameters", {})
-                params   = _inject_context(params, tool, step_results, goal=goal)
+                params   = _inject_context(params, tool, step_results, goal=goal, task_id=task_id, step_num=step_num)
 
-                print(f"\n[Executor] ▶️ Step {step_num}: [{tool}] {desc}")
-                _log_task_event(task_id, step_num, tool, desc, "started")
+                log_task_event(task_id, step_num, tool, desc, "started")
+                step_start = time.monotonic()
 
                 attempt = 1
                 step_ok = False
@@ -286,20 +273,25 @@ class AgentExecutor:
                     if cancel_flag and cancel_flag.is_set():
                         break
                     try:
-                        result = _call_tool(tool, params, speak)
+                        result = _call_tool(tool, params, speak, task_id=task_id, step_num=step_num)
                         step_results[step_num] = result
                         completed_steps.append(step)
-                        print(f"[Executor] ✅ Step {step_num} done: {str(result)[:100]}")
-                        _log_task_event(task_id, step_num, tool, desc, "done", str(result)[:200])
+                        log_task_event(
+                            task_id, step_num, tool, desc, "done", str(result)[:200],
+                            duration_ms=int((time.monotonic() - step_start) * 1000),
+                        )
                         step_ok = True
                         break
 
                     except Exception as e:
                         error_msg = str(e)
-                        print(f"[Executor] ❌ Step {step_num} attempt {attempt} failed: {error_msg}")
-                        _log_task_event(task_id, step_num, tool, desc, "failed", f"attempt {attempt}: {error_msg}")
+                        # Non-terminal — a retry/skip/replan-fix may still turn
+                        # this step into a success. Kept distinct from the
+                        # terminal 'failed' status below so a tool's true
+                        # failure rate isn't inflated by every transient retry.
+                        log_task_event(task_id, step_num, tool, desc, "attempt_failed", f"attempt {attempt}: {error_msg}")
 
-                        recovery = analyze_error(step, error_msg, attempt=attempt)
+                        recovery = analyze_error(step, error_msg, attempt=attempt, task_id=task_id)
                         decision = recovery["decision"]
                         user_msg = recovery.get("user_message", "")
 
@@ -307,21 +299,26 @@ class AgentExecutor:
                             speak(user_msg)
 
                         if decision == ErrorDecision.RETRY:
-                            _log_task_event(task_id, step_num, tool, desc, "retried", f"attempt {attempt} -> {attempt + 1}")
+                            log_task_event(task_id, step_num, tool, desc, "retried", f"attempt {attempt} -> {attempt + 1}")
                             attempt += 1
                             time.sleep(2)
                             continue
 
                         elif decision == ErrorDecision.SKIP:
-                            print(f"[Executor] ⏭️ Skipping step {step_num}")
-                            _log_task_event(task_id, step_num, tool, desc, "done", "skipped (non-critical)")
+                            log_task_event(
+                                task_id, step_num, tool, desc, "skipped", "skipped (non-critical)",
+                                duration_ms=int((time.monotonic() - step_start) * 1000),
+                            )
                             completed_steps.append(step)
                             step_ok = True
                             break
 
                         elif decision == ErrorDecision.ABORT:
                             msg = f"Task aborted, sir. {recovery.get('reason', '')}"
-                            _log_task_event(task_id, step_num, tool, desc, "failed", f"aborted: {recovery.get('reason', '')}")
+                            log_task_event(
+                                task_id, step_num, tool, desc, "failed", f"aborted: {recovery.get('reason', '')}",
+                                duration_ms=int((time.monotonic() - step_start) * 1000),
+                            )
                             if speak: speak(msg)
                             return msg
 
@@ -329,37 +326,42 @@ class AgentExecutor:
                             fix_suggestion = recovery.get("fix_suggestion", "")
                             if fix_suggestion and tool != "generated_code":
                                 try:
-                                    fixed_step = generate_fix(step, error_msg, fix_suggestion)
+                                    fixed_step = generate_fix(step, error_msg, fix_suggestion, task_id=task_id)
                                     if speak: speak("Trying an alternative approach, sir.")
                                     res = _call_tool(
                                         fixed_step["tool"],
                                         fixed_step["parameters"],
                                         speak,
+                                        task_id=task_id, step_num=step_num,
                                     )
                                     if isinstance(res, str) and any(
                                         marker in res for marker in _RECOVERY_NOT_EXECUTED_MARKERS
                                     ):
-                                        print(
-                                            f"[Executor] Recovery via code_helper was denied — no live user "
-                                            f"to confirm (player=None). Autonomous code-fix recovery cannot run in "
-                                            f"this context."
+                                        _log.info(
+                                            "Recovery via code_helper was denied — no live user to confirm "
+                                            "(player=None). Autonomous code-fix recovery cannot run in this context.",
+                                            extra={"task_id": task_id},
                                         )
-                                        _log_task_event(
+                                        log_task_event(
                                             task_id, step_num, tool, desc, "failed",
                                             "recovery fix denied — no live user to confirm (player=None)",
+                                            duration_ms=int((time.monotonic() - step_start) * 1000),
                                         )
                                     else:
-                                        _log_task_event(
+                                        log_task_event(
                                             task_id, step_num, fixed_step.get("tool"), desc, "done",
                                             f"recovered via fix: {str(res)[:150]}",
+                                            duration_ms=int((time.monotonic() - step_start) * 1000),
                                         )
                                         step_results[step_num] = res
                                         completed_steps.append(step)
                                         step_ok = True
                                         break
                                 except Exception as fix_err:
-                                    print(f"[Executor] ⚠️ Fix failed: {fix_err}")
-                                    _log_task_event(task_id, step_num, tool, desc, "failed", f"fix generation failed: {fix_err}")
+                                    log_task_event(
+                                        task_id, step_num, tool, desc, "failed", f"fix generation failed: {fix_err}",
+                                        duration_ms=int((time.monotonic() - step_start) * 1000),
+                                    )
 
                             failed_step  = step
                             failed_error = error_msg
@@ -370,13 +372,16 @@ class AgentExecutor:
                     failed_step  = step
                     failed_error = "Max retries exceeded"
                     success      = False
-                    _log_task_event(task_id, step_num, tool, desc, "failed", "max retries exceeded")
+                    log_task_event(
+                        task_id, step_num, tool, desc, "failed", "max retries exceeded",
+                        duration_ms=int((time.monotonic() - step_start) * 1000),
+                    )
 
                 if not success:
                     break
 
             if success:
-                return self._summarize(goal, completed_steps, speak)
+                return self._summarize(goal, completed_steps, speak, task_id=task_id)
 
             if replan_attempts >= self.MAX_REPLAN_ATTEMPTS:
                 msg = f"Task failed after {replan_attempts} replan attempts, sir."
@@ -384,15 +389,15 @@ class AgentExecutor:
                 return msg
 
             if speak: speak("Adjusting my approach, sir.")
-            _log_task_event(
+            log_task_event(
                 task_id, failed_step.get("step") if failed_step else None,
                 failed_step.get("tool") if failed_step else None, goal[:200],
                 "replanned", f"after step failure: {failed_error[:150]}",
             )
             replan_attempts += 1
-            plan = replan(goal, completed_steps, failed_step, failed_error)
+            plan = replan(goal, completed_steps, failed_step, failed_error, task_id=task_id)
 
-    def _summarize(self, goal: str, completed_steps: list, speak: Callable | None) -> str:
+    def _summarize(self, goal: str, completed_steps: list, speak: Callable | None, task_id: str | None = None) -> str:
         fallback  = f"All done, sir. Completed {len(completed_steps)} steps for: {goal[:60]}."
         steps_str = "\n".join(f"- {s.get('description', '')}" for s in completed_steps)
         prompt    = (
@@ -402,7 +407,7 @@ class AgentExecutor:
             "Address the user as 'sir'. Be direct and positive."
         )
         try:
-            summary = call_llm_text(prompt)
+            summary = call_llm_text(prompt, task_id=task_id, purpose="summarize task")
             if summary:
                 if speak: speak(summary)
                 return summary

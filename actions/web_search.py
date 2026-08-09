@@ -3,6 +3,9 @@
 import json
 
 from config import BASE_DIR
+import logging
+
+_log = logging.getLogger("jarvis.web_search")
 
 
 def _ddg_search(query: str, max_results: int = 6) -> list[dict]:
@@ -90,19 +93,19 @@ def web_search(
     if player:
         player.write_log(f"[Search] {query or ', '.join(items)}")
 
-    print(f"[WebSearch] 🔍 Query: {query!r}  Mode: {mode}")
+    _log.debug(f"🔍 Query: {query!r}  Mode: {mode}")
 
     try:
         if mode == "compare" and items:
-            print(f"[WebSearch] 📊 Comparing: {items}")
+            _log.debug(f"📊 Comparing: {items}")
             return _compare(items, aspect)
 
         results = _ddg_search(query)
         raw     = _format_ddg(query, results)
-        print(f"[WebSearch] ✅ DDG: {len(results)} result(s).")
+        _log.debug(f"✅ DDG: {len(results)} result(s).")
         # Let Ollama summarise the results for a cleaner spoken response
         return _llm_summarize(query, raw)
 
     except Exception as e:
-        print(f"[WebSearch] ❌ Failed: {e}")
+        _log.error(f"❌ Failed: {e}")
         return f"Search failed, sir: {e}"

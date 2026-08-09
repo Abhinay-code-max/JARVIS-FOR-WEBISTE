@@ -1,3 +1,4 @@
+import logging
 import threading
 import time
 import uuid
@@ -6,6 +7,8 @@ from enum import Enum
 from typing import Callable, Any
 
 from core.db import get_conn
+
+_log = logging.getLogger("jarvis.task_queue")
 
 
 class TaskStatus(Enum):
@@ -51,7 +54,7 @@ def _reconcile_interrupted_tasks() -> None:
         )
         n = cur.rowcount
     if n:
-        print(f"[TaskQueue] ⚠️ Marked {n} orphaned task(s) from a previous run as interrupted.")
+        _log.warning("Marked %d orphaned task(s) from a previous run as interrupted.", n)
 
 
 class TaskQueue:
@@ -97,13 +100,13 @@ class TaskQueue:
             name="AgentTaskQueue"
         )
         self._worker_thread.start()
-        print("[TaskQueue] ✅ Started")
+        _log.info("Started")
 
     def stop(self) -> None:
         self._running = False
         with self._condition:
             self._condition.notify_all()
-        print("[TaskQueue] 🔴 Stopped")
+        _log.info("Stopped")
 
     def submit(
         self,
@@ -137,7 +140,7 @@ class TaskQueue:
                 (task_id, goal, task.priority, task.status.value, None, "", task.created_at, task.created_at),
             )
 
-        print(f"[TaskQueue] 📥 Task queued: [{task_id}] {goal[:60]}")
+        _log.info("Task queued: %s", goal[:60], extra={"task_id": task_id})
         return task_id
 
     def cancel(self, task_id: str) -> bool:
@@ -151,7 +154,7 @@ class TaskQueue:
 
             task.cancel_flag.set()
             task.status = TaskStatus.CANCELLED
-            print(f"[TaskQueue] 🚫 Task cancelled: [{task_id}]")
+            _log.info("Task cancelled", extra={"task_id": task_id})
 
         self._write_task_row(task_id, status=TaskStatus.CANCELLED.value)
         return True
@@ -222,7 +225,7 @@ class TaskQueue:
         return None
 
     def _run_task(self, task: Task) -> None:
-        print(f"[TaskQueue] ▶️ Running: [{task.task_id}] {task.goal[:60]}")
+        _log.info("Running: %s", task.goal[:60], extra={"task_id": task.task_id})
         try:
             executor = self._get_executor()
             result   = executor.execute(
@@ -250,9 +253,9 @@ class TaskQueue:
                 try:
                     task.on_complete(task.task_id, result)
                 except Exception as e:
-                    print(f"[TaskQueue] ⚠️ on_complete callback error: {e}")
+                    _log.warning("on_complete callback error: %s", e, extra={"task_id": task.task_id})
 
-            print(f"[TaskQueue] ✅ Completed: [{task.task_id}]")
+            _log.info("Completed", extra={"task_id": task.task_id})
 
         except Exception as e:
             with self._lock:
@@ -260,7 +263,7 @@ class TaskQueue:
                 task.error  = str(e)
                 self._active_count -= 1
             self._write_task_row(task.task_id, status=TaskStatus.FAILED.value, error=task.error)
-            print(f"[TaskQueue] ❌ Failed: [{task.task_id}] {e}")
+            _log.error("Failed: %s", e, extra={"task_id": task.task_id})
 
         with self._condition:
             self._condition.notify()

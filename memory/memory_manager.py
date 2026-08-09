@@ -1,7 +1,10 @@
+import logging
 from datetime import datetime
 
 from config import BASE_DIR
 from core.db import get_conn
+
+_log = logging.getLogger("jarvis.memory")
 
 # Legacy JSON location — no longer read/written directly (see
 # core.db._migrate_legacy_memory), but memory_manager.py still owns this
@@ -101,7 +104,7 @@ def _evict_over_budget(conn) -> list[tuple[str, str]]:
         )
         total -= row["vlen"]
         evicted.append((row["category"], row["key"]))
-        print(f"[Memory] 🗑️  Trimmed {row['category']}/{row['key']}")
+        _log.info("Trimmed %s/%s", row['category'], row['key'])
     return evicted
 
 
@@ -166,11 +169,11 @@ def update_memory(memory_update: dict) -> dict:
         if _recursive_update(memory, memory_update):
             _upsert_entries(conn, memory)
             evicted = _evict_over_budget(conn)
-            msg = f"[Memory] 💾 Saved: {list(memory_update.keys())}"
+            msg = f"Saved: {list(memory_update.keys())}"
             if evicted:
                 forgotten = ", ".join(f"{cat}/{key}" for cat, key in evicted)
                 msg += f" | Memory limit reached — forgot: {forgotten}"
-            print(msg)
+            _log.info(msg)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -287,7 +290,7 @@ def forget(key: str, category: str = "notes") -> str:
 
     if evicted:
         forgotten = ", ".join(f"{c}/{k}" for c, k in evicted)
-        print(f"[Memory] 💾 Saved after forget | Memory limit reached — forgot: {forgotten}")
+        _log.info("Saved after forget | Memory limit reached — forgot: %s", forgotten)
     return f"Forgotten: {category}/{key}"
 
 

@@ -6,6 +6,9 @@ import requests
 
 from config import load_config as _load_config, BASE_DIR
 from memory.memory_manager import load_memory as _load_memory
+import logging
+
+_log = logging.getLogger("jarvis.daily_briefing")
 
 
 def _extract_value(entry, _depth: int = 0) -> str:
@@ -73,14 +76,14 @@ def _get_weather_summary(city: str, api_key: str) -> str:
         params = {"q": city, "appid": api_key, "units": "metric"}
         r = requests.get(url, params=params, timeout=8)
         if r.status_code != 200:
-            print(f"[DailyBriefing] Weather API returned {r.status_code} for city='{city}'")
+            _log.debug(f"Weather API returned {r.status_code} for city='{city}'")
             return ""
         data = r.json()
         temp = round(data["main"]["temp"])
         desc = data["weather"][0]["description"]
         return f"It's currently {temp}°C and {desc} in {city}."
     except Exception as e:
-        print(f"[DailyBriefing] Weather error: {e}")
+        _log.warning(f"Weather error: {e}")
         return ""
 
 
@@ -111,7 +114,7 @@ def _get_top_news_headline() -> str:
             if titles:
                 return " Also in the news: " + "; ".join(titles) + "."
     except Exception as e:
-        print(f"[DailyBriefing] News error: {e}")
+        _log.warning(f"News error: {e}")
     return ""
 
 
@@ -121,7 +124,7 @@ def daily_briefing(parameters: dict = None, player=None, speak=None) -> str:
     api_key = cfg.get("openweather_api_key", "")
 
     city = parameters.get("city") or _get_user_city()
-    print(f"[DailyBriefing] Resolved city: '{city}'")
+    _log.debug(f"Resolved city: '{city}'")
 
     now  = datetime.now()
     hour = now.hour

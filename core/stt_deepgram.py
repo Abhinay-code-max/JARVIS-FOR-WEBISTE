@@ -8,6 +8,7 @@ Fixed to match the verified working pattern (ABNF.OPCODE_BINARY).
 from __future__ import annotations
 import io
 import json
+import logging
 import threading
 import time
 
@@ -15,6 +16,8 @@ import numpy as np
 import sounddevice as sd
 
 from config import load_config
+
+_log = logging.getLogger("jarvis.stt_deepgram")
 
 SAMPLE_RATE = 16_000
 CHANNELS    = 1
@@ -33,7 +36,7 @@ class DeepgramSTT:
         self._language = language if language != "auto" else "en"
         if not self._api_key:
             raise ValueError("Deepgram API key not found in config/api_keys.json")
-        print(f"[DeepgramSTT] Ready. Language={self._language}")
+        _log.info("Ready. Language=%s", self._language)
 
     def transcribe(self, audio: np.ndarray) -> str:
         return ""  # Not used — streaming mode handles everything
@@ -96,9 +99,9 @@ class DeepgramStreamingSTT:
             try:
                 self._connect_and_stream()
             except Exception as e:
-                print(f"[DeepgramStreaming] Connection error: {e}")
+                _log.error("Connection error: %s", e)
             if self._running:
-                print("[DeepgramStreaming] Reconnecting in 2s...")
+                _log.info("Reconnecting in 2s...")
                 time.sleep(2)
 
     def _connect_and_stream(self):
@@ -141,25 +144,33 @@ class DeepgramStreamingSTT:
                     self._silence_n   = 0
                     self._nudge_shown = False
                 if transcript and is_final:
-                    print(f"[DeepgramStreaming] FINAL: {transcript}")
+                    # Runs on the same thread as run_forever() below — the
+                    # Deepgram recv thread named in core/db.py's hard rule.
+                    # Safe only because this is a logger call (queued), not
+                    # a direct DB/console write.
+                    _log.debug("FINAL: %s", transcript)
                     if self._on_transcript:
                         self._on_transcript(transcript)
             except Exception as e:
-                print(f"[DeepgramStreaming] parse error: {e}")
+                _log.warning("parse error: %s", e)
 
         def on_error(ws, error):
-            print(f"[DeepgramStreaming] WS error: {error}")
+            _log.error("WS error: %s", error)
 
         def on_close(ws, code, msg):
-            print(f"[DeepgramStreaming] Closed. code={code} msg={msg}")
+            _log.info("Closed. code=%s msg=%s", code, msg)
             conn_open.clear()
 
         def on_open(ws):
-            print("[DeepgramStreaming] Connected to Deepgram Nova-2.")
+            _log.info("Connected to Deepgram Nova-2.")
             conn_open.set()
 
             def audio_thread():
                 def callback(indata, frames, time_info, status):
+                    # The PortAudio callback thread itself — the hottest
+                    # path in the app. Must never block on I/O; safe here
+                    # only because this is a logger call (queued), never a
+                    # direct DB/console write.
                     if not self._running:
                         return
                     audio = indata[:, 0]
@@ -167,7 +178,7 @@ class DeepgramStreamingSTT:
                     try:
                         ws.send(pcm, opcode=websocket.ABNF.OPCODE_BINARY)
                     except Exception as e:
-                        print(f"[DeepgramStreaming] send error: {e}")
+                        _log.error("send error: %s", e)
 
                     if self._is_muted and self._is_muted():
                         return
@@ -220,7 +231,7 @@ class DeepgramStreamingSTT:
                         while self._running and conn_open.is_set():
                             time.sleep(0.1)
                 except Exception as e:
-                    print(f"[DeepgramStreaming] mic stream error: {e}")
+                    _log.error("mic stream error: %s", e)
 
                 try:
                     ws.send(json.dumps({"type": "CloseStream"}))

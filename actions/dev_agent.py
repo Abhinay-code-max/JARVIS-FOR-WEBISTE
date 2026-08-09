@@ -11,6 +11,9 @@ PROJECTS_DIR     = Path.home() / "Desktop" / "JarvisProjects"
 MAX_FIX_ATTEMPTS = 5
 
 from core.llm_client import call_llm_text as _llm
+import logging
+
+_log = logging.getLogger("jarvis.dev_agent")
 
 
 def _strip_fences(text: str) -> str:
@@ -163,7 +166,7 @@ def _write_file(
         full_path = project_dir / file_path
         full_path.parent.mkdir(parents=True, exist_ok=True)
         full_path.write_text(code, encoding="utf-8")
-        print(f"[DevAgent] ✅ Written: {file_path} ({len(code)} chars)")
+        _log.debug(f"✅ Written: {file_path} ({len(code)} chars)")
         return code
     except Exception as e:
         raise
@@ -182,7 +185,7 @@ def _install_dependencies(dependencies: list[str], project_dir: Path, player=Non
         if result.returncode != 0:
             to_install.append(dep)
         else:
-            print(f"[DevAgent] ✓ Already installed: {pkg_name}")
+            _log.debug(f"✓ Already installed: {pkg_name}")
 
     if not to_install:
         return f"All dependencies already installed: {', '.join(dependencies)}"
@@ -191,7 +194,7 @@ def _install_dependencies(dependencies: list[str], project_dir: Path, player=Non
     if not CONFIRM.request(player, f"I need to pip install these packages: {', '.join(to_install)}", speak=speak):
         return "Cancelled — did not install dependencies."
 
-    print(f"[DevAgent] 📦 Installing: {to_install}")
+    _log.debug(f"📦 Installing: {to_install}")
     try:
         result = subprocess.run(
             [sys.executable, "-m", "pip", "install"] + to_install,
@@ -231,7 +234,7 @@ def _open_vscode(project_dir: Path) -> bool:
                 stderr=subprocess.DEVNULL
             )
             time.sleep(1.5)
-            print(f"[DevAgent] 💻 VSCode opened: {project_dir}")
+            _log.debug(f"💻 VSCode opened: {project_dir}")
             return True
         except Exception:
             continue
@@ -242,7 +245,7 @@ def _run_project(run_command: str, project_dir: Path, timeout: int = 30, player=
     if not CONFIRM.request(player, f"I'm about to run: {run_command}", speak=speak):
         return "Cancelled — did not run the project."
 
-    print(f"[DevAgent] 🚀 Running: {run_command}")
+    _log.debug(f"🚀 Running: {run_command}")
     try:
         parts = run_command.split()
         if parts[0].lower() == "python":
@@ -289,7 +292,7 @@ def _try_auto_install(error_output: str, project_dir: Path, player=None, speak=N
     if not CONFIRM.request(player, f"Missing package detected: {pkg}. I'd like to pip install it", speak=speak):
         return False
 
-    print(f"[DevAgent] 🔧 Auto-installing missing package: {pkg}")
+    _log.debug(f"🔧 Auto-installing missing package: {pkg}")
     try:
         result = subprocess.run(
             [sys.executable, "-m", "pip", "install", pkg],
@@ -360,9 +363,9 @@ def _fix_files(
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(fixed, encoding="utf-8")
             updated_codes[fix_path] = fixed
-            print(f"[DevAgent] 🔧 Fixed: {fix_path}")
+            _log.debug(f"🔧 Fixed: {fix_path}")
         except Exception as e:
-            print(f"[DevAgent] ⚠️ Could not fix {fix_path}: {e}")
+            _log.warning(f"⚠️ Could not fix {fix_path}: {e}")
 
     return updated_codes
 
@@ -376,7 +379,7 @@ def _build_project(
 ) -> str:
 
     def log(msg: str):
-        print(f"[DevAgent] {msg}")
+        _log.debug(f"{msg}")
         if player:
             player.write_log(f"[DevAgent] {msg}")
 

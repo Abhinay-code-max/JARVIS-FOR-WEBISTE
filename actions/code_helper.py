@@ -11,6 +11,9 @@ DESKTOP            = Path.home() / "Desktop"
 MAX_BUILD_ATTEMPTS = 3
 
 from core.llm_client import call_llm_text as _llm, call_llm_vision as _llm_vision
+import logging
+
+_log = logging.getLogger("jarvis.code_helper")
 
 
 def _clean_code(text: str) -> str:
@@ -77,10 +80,10 @@ def _take_screenshot() -> Path | None:
         screenshot_path = Path.home() / "Desktop" / f"jarvis_debug_{int(time.time())}.png"
         screenshot = pyautogui.screenshot()
         screenshot.save(str(screenshot_path))
-        print(f"[Code] 📸 Screenshot: {screenshot_path}")
+        _log.debug(f"📸 Screenshot: {screenshot_path}")
         return screenshot_path
     except Exception as e:
-        print(f"[Code] ⚠️ Screenshot failed: {e}")
+        _log.warning(f"⚠️ Screenshot failed: {e}")
         return None
 
 
@@ -204,7 +207,7 @@ def _build(description, language, output_path, args, timeout, speak=None, player
 
     try:
         code, path = _write(description, lang, output_path, player)
-        print(f"[Code] ✅ Written: {path}")
+        _log.debug(f"✅ Written: {path}")
     except Exception as e:
         msg = f"Could not write initial code: {e}"
         if speak: speak(msg)
@@ -212,7 +215,7 @@ def _build(description, language, output_path, args, timeout, speak=None, player
 
     last_output = ""
     for attempt in range(1, MAX_BUILD_ATTEMPTS + 1):
-        print(f"[Code] 🔄 Attempt {attempt}/{MAX_BUILD_ATTEMPTS}")
+        _log.debug(f"🔄 Attempt {attempt}/{MAX_BUILD_ATTEMPTS}")
         if player:
             player.write_log(f"[Code] Attempt {attempt}...")
 
@@ -227,7 +230,7 @@ def _build(description, language, output_path, args, timeout, speak=None, player
             if speak: speak(msg)
             return f"{msg}\n\nOutput:\n{last_output}"
 
-        print(f"[Code] ⚠️ Error on attempt {attempt}, fixing...")
+        _log.debug(f"⚠️ Error on attempt {attempt}, fixing...")
         if player:
             player.write_log(f"[Code] Fixing (attempt {attempt})...")
 
@@ -253,7 +256,7 @@ def _write_action(description, language, output_path, player) -> str:
         player.write_log("[Code] Writing code...")
     try:
         code, path = _write(description, language, output_path, player)
-        print(f"[Code] ✅ Written: {path}")
+        _log.debug(f"✅ Written: {path}")
         return f"Code written. Saved to: {path}\n\nPreview:\n{_preview(code)}"
     except Exception as e:
         return f"Could not generate code: {e}"
@@ -284,7 +287,7 @@ def _edit_action(file_path, instruction, player) -> str:
         return f"Could not edit code: {e}"
 
     status = _save_file(Path(file_path), edited)
-    print(f"[Code] ✅ Edited: {file_path}")
+    _log.debug(f"✅ Edited: {file_path}")
     return f"File edited. {status}\n\nPreview:\n{_preview(edited)}"
 
 
@@ -352,7 +355,7 @@ def _optimize_action(file_path, code, language, output_path, player) -> str:
         save_path = _resolve_save_path(output_path, lang)
 
     status = _save_file(save_path, optimized)
-    print(f"[Code] ✅ Optimized: {save_path}")
+    _log.debug(f"✅ Optimized: {save_path}")
 
     original_lines  = len(code.splitlines())
     optimized_lines = len(optimized.splitlines())
@@ -371,7 +374,7 @@ def _screen_debug_action(description, file_path, player, speak=None) -> str:
     if player:
         player.write_log("[Code] Taking screenshot for analysis...")
 
-    print("[Code] 📸 Capturing screen for debug...")
+    _log.debug("📸 Capturing screen for debug...")
 
 
     screenshot_path = _take_screenshot()
@@ -383,7 +386,7 @@ def _screen_debug_action(description, file_path, player, speak=None) -> str:
     if file_path:
         file_content, err = _read_file(file_path)
         if err:
-            print(f"[Code] ⚠️ Could not read file: {err}")
+            _log.debug(f"⚠️ Could not read file: {err}")
 
     try:
         from config import load_config as _load_config
@@ -405,7 +408,7 @@ def _screen_debug_action(description, file_path, player, speak=None) -> str:
         )
 
         analysis = _llm_vision(analysis_prompt, image_bytes, model=vision_model, timeout=60).strip()
-        print("[Code] ✅ Screen analysis complete")
+        _log.debug("✅ Screen analysis complete")
 
         try:
             screenshot_path.unlink()
@@ -419,7 +422,7 @@ def _screen_debug_action(description, file_path, player, speak=None) -> str:
                 save_path  = Path(file_path)
                 _save_file(save_path, fixed_code)
                 analysis += f"\n\n✅ Fixed code has been saved to: {file_path}"
-                print(f"[Code] ✅ Fixed code saved: {file_path}")
+                _log.debug(f"✅ Fixed code saved: {file_path}")
 
         return analysis
 
@@ -463,7 +466,7 @@ def code_helper(
 
     if action == "auto":
         action = _detect_intent(description, file_path, code)
-        print(f"[Code] 🤖 Auto-detected: {action}")
+        _log.debug(f"🤖 Auto-detected: {action}")
 
     if action == "write":
         return _write_action(description, language, output_path, player)

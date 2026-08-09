@@ -7,6 +7,9 @@ from datetime import datetime
 from pathlib import Path
 
 from config import get_os
+import logging
+
+_log = logging.getLogger("jarvis.reminder")
 
 
 def _scripts_dir() -> Path:
@@ -175,7 +178,7 @@ def _schedule_windows(target_dt: datetime, task_name: str,
     if result.returncode != 0:
         script_path.unlink(missing_ok=True)
         err = (result.stderr or result.stdout).strip()
-        print(f"[Reminder] ❌ schtasks: {err}")
+        _log.error(f"❌ schtasks: {err}")
         return ""  
 
     return task_name
@@ -225,7 +228,7 @@ def _schedule_mac(target_dt: datetime, task_name: str,
     if result.returncode != 0:
         plist_path.unlink(missing_ok=True)
         script_path.unlink(missing_ok=True)
-        print(f"[Reminder] ❌ launchctl: {result.stderr.strip()}")
+        _log.error(f"❌ launchctl: {result.stderr.strip()}")
         return ""
 
     return label
@@ -249,7 +252,7 @@ def _schedule_linux(target_dt: datetime, task_name: str,
         )
         if result.returncode == 0:
             return task_name
-        print(f"[Reminder] ⚠️ systemd-run failed: {result.stderr.strip()}, trying 'at'")
+        _log.debug(f"⚠️ systemd-run failed: {result.stderr.strip()}, trying 'at'")
 
     if shutil.which("at"):
         at_time = target_dt.strftime("%H:%M %Y-%m-%d")
@@ -260,10 +263,10 @@ def _schedule_linux(target_dt: datetime, task_name: str,
         )
         if result.returncode == 0:
             return task_name
-        print(f"[Reminder] ❌ at: {result.stderr.strip()}")
+        _log.error(f"❌ at: {result.stderr.strip()}")
         return ""
 
-    print("[Reminder] ❌ Neither systemd-run nor at found on this Linux system.")
+    _log.error("❌ Neither systemd-run nor at found on this Linux system.")
     return ""
 
 def reminder(
@@ -306,7 +309,7 @@ def reminder(
             job_id = _schedule_linux(target_dt, task_name, script_path)
     except Exception as e:
         script_path.unlink(missing_ok=True)
-        print(f"[Reminder] ❌ Scheduling exception: {e}")
+        _log.error(f"❌ Scheduling exception: {e}")
         return "Something went wrong while scheduling the reminder."
 
     if not job_id:

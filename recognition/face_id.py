@@ -17,11 +17,14 @@ Enrollment data is stored as NumPy .npy files:
 """
 
 from __future__ import annotations
+import logging
 import time
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
+
+_log = logging.getLogger("jarvis.face_id")
 
 
 class FaceIdentifier:
@@ -41,9 +44,9 @@ class FaceIdentifier:
             name = p.stem
             try:
                 self._encodings[name] = np.load(str(p))
-                print(f"[FaceID] Loaded encoding for '{name}'")
+                _log.debug("Loaded encoding for '%s'", name)
             except Exception as e:
-                print(f"[FaceID] Could not load {p}: {e}")
+                _log.warning("Could not load %s: %s", p, e)
 
     # ── Identify ──────────────────────────────────────────────────────────────
     def identify(self, timeout: float = 5.0) -> tuple[Optional[str], float]:
@@ -61,12 +64,12 @@ class FaceIdentifier:
             import face_recognition
             import cv2
         except ImportError:
-            print("[FaceID] face_recognition or cv2 not installed — skipping face scan.")
+            _log.warning("face_recognition or cv2 not installed — skipping face scan.")
             return None, 0.0
 
         cam = cv2.VideoCapture(0)
         if not cam.isOpened():
-            print("[FaceID] No camera available.")
+            _log.warning("No camera available.")
             return None, 0.0
 
         best_name  = None
@@ -113,7 +116,7 @@ class FaceIdentifier:
             import face_recognition
             import cv2
         except ImportError:
-            print("[FaceID] face_recognition or cv2 not installed.")
+            _log.warning("face_recognition or cv2 not installed.")
             return False
 
         cam = cv2.VideoCapture(0)
@@ -121,7 +124,7 @@ class FaceIdentifier:
             return False
 
         collected = []
-        print(f"[FaceID] Capturing {self.CAPTURE_N} frames for '{name}'…")
+        _log.info("Capturing %d frames for '%s'…", self.CAPTURE_N, name)
 
         try:
             while len(collected) < self.CAPTURE_N:
@@ -146,7 +149,7 @@ class FaceIdentifier:
         out_path = self._dir / f"{name}.npy"
         np.save(str(out_path), mean_enc)
         self._encodings[name] = mean_enc
-        print(f"[FaceID] Registered '{name}' ({len(collected)} frames).")
+        _log.info("Registered '%s' (%d frames).", name, len(collected))
         return True
 
     # ── Matching helper ───────────────────────────────────────────────────────

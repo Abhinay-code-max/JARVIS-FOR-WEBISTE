@@ -29,6 +29,9 @@ from datetime import datetime
 
 from core.llm_client import call_llm_text as _llm_text
 from core.llm_client import call_llm_vision as _llm_vision
+import logging
+
+_log = logging.getLogger("jarvis.file_processor")
 
 
 def _transcribe_audio_bytes(data: bytes, mime: str = "audio/wav") -> str:
@@ -76,12 +79,12 @@ def _gemini_client():
                     sent_bytes = buf.getvalue()
                     debug_path = Path(tempfile.gettempdir()) / "jarvis_last_sent_vision_image.png"
                     debug_path.write_bytes(sent_bytes)
-                    print(f"[FileProcessor][vision] sent size    = {len(sent_bytes)} bytes")
-                    print(f"[FileProcessor][vision] sent md5     = {hashlib.md5(sent_bytes).hexdigest()}")
-                    print(f"[FileProcessor][vision] sent dims    = {media.size}")
-                    print(f"[FileProcessor][vision] sent copy saved to = {debug_path}")
+                    _log.debug(f"[vision] sent size    = {len(sent_bytes)} bytes")
+                    _log.debug(f"[vision] sent md5     = {hashlib.md5(sent_bytes).hexdigest()}")
+                    _log.debug(f"[vision] sent dims    = {media.size}")
+                    _log.debug(f"[vision] sent copy saved to = {debug_path}")
                     r.text = _llm_vision(text, sent_bytes)
-                    print(f"[FileProcessor][vision] RAW model response = {r.text!r}")
+                    _log.debug(f"[vision] RAW model response = {r.text!r}")
                     return r
                 if isinstance(media, dict) and "data" in media:
                     r.text = _transcribe_audio_bytes(media["data"], media.get("mime_type", "audio/wav"))
@@ -140,12 +143,12 @@ def _process_image(path: Path, action: str, params: dict, speak=None) -> str:
     if action in ("describe", "ocr", "analyze", "read", "extract_text"):
         try:
             src_bytes = path.read_bytes()
-            print(f"[FileProcessor][vision] source file  = {path}")
-            print(f"[FileProcessor][vision] source size   = {len(src_bytes)} bytes")
-            print(f"[FileProcessor][vision] source md5    = {hashlib.md5(src_bytes).hexdigest()}")
+            _log.debug(f"[vision] source file  = {path}")
+            _log.debug(f"[vision] source size   = {len(src_bytes)} bytes")
+            _log.debug(f"[vision] source md5    = {hashlib.md5(src_bytes).hexdigest()}")
             model  = _gemini_client()
             img    = Image.open(path)
-            print(f"[FileProcessor][vision] decoded dims  = {img.size} mode={img.mode}")
+            _log.debug(f"[vision] decoded dims  = {img.size} mode={img.mode}")
             prompt = {
                 "describe": "Describe this image in detail.",
                 "ocr":      "Extract all text visible in this image. Return only the text, formatted clearly.",
@@ -847,7 +850,7 @@ def file_processor(parameters: dict, player=None, speak=None) -> str:
     params      = {**parameters, "instruction": instruction}
 
     log_msg = f"[FileProcessor] {file_type.upper()} | {path.name} | action={action or 'auto'}"
-    print(log_msg)
+    _log.debug(log_msg)
     if player:
         player.write_log(log_msg)
 

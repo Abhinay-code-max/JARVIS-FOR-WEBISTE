@@ -4,6 +4,9 @@ import time
 from pathlib import Path
 
 from config import BASE_DIR, get_os
+import logging
+
+_log = logging.getLogger("jarvis.send_message")
 
 try:
     import pyautogui
@@ -49,7 +52,7 @@ def _resolve_contact(name: str) -> str:
     # Partial match — spoken name contained in key or key contained in spoken name
     for alias, exact in contacts.items():
         if alias in name_lower or name_lower in alias:
-            print(f"[Contacts] Matched '{name}' → '{exact}'")
+            _log.debug(f"Matched '{name}' → '{exact}'")
             return exact
 
     # Character-level similarity (simple)
@@ -62,7 +65,7 @@ def _resolve_contact(name: str) -> str:
             best_match = exact
 
     if best_score > 0.6 and best_match:
-        print(f"[Contacts] Fuzzy matched '{name}' → '{best_match}' ({best_score:.0%})")
+        _log.debug(f"Fuzzy matched '{name}' → '{best_match}' ({best_score:.0%})")
         return best_match
 
     return name  # fallback: use as-is
@@ -117,7 +120,7 @@ def _open_whatsapp_windows() -> bool:
         time.sleep(1.2)  # give WhatsApp time to open and load
         return True
     except Exception as e:
-        print(f"[SendMessage] Could not open WhatsApp: {e}")
+        _log.warning(f"Could not open WhatsApp: {e}")
         return False
 
 
@@ -126,7 +129,7 @@ def _send_whatsapp(receiver: str, message: str) -> str:
 
     # Resolve contact name from contacts.json
     exact_name = _resolve_contact(receiver)
-    print(f"[SendMessage] WhatsApp → resolved '{receiver}' to '{exact_name}'")
+    _log.debug(f"WhatsApp → resolved '{receiver}' to '{exact_name}'")
 
     os_name = get_os()
 
@@ -194,7 +197,7 @@ def _open_app(app_name: str) -> bool:
             time.sleep(1.2)
             return True
     except Exception as e:
-        print(f"[SendMessage] Could not open {app_name}: {e}")
+        _log.warning(f"Could not open {app_name}: {e}")
         return False
 
 
@@ -205,7 +208,7 @@ def _open_browser_url(url: str) -> bool:
         time.sleep(1.2)
         return True
     except Exception as e:
-        print(f"[SendMessage] Could not open browser: {e}")
+        _log.warning(f"Could not open browser: {e}")
         return False
 
 
@@ -320,7 +323,7 @@ def send_message(
         return "PyAutoGUI is not installed — cannot control the desktop."
 
     preview = message_text[:50] + ("…" if len(message_text) > 50 else "")
-    print(f"[SendMessage] 📨 {platform} → {receiver}: {preview}")
+    _log.debug(f"📨 {platform} → {receiver}: {preview}")
     if player:
         player.write_log(f"SYS: sending message to {receiver} via {platform}")
 
@@ -330,7 +333,10 @@ def send_message(
     except Exception as e:
         result = f"Could not send message: {e}"
 
-    print(f"[SendMessage] {'✅' if 'sent' in result.lower() else '❌'} {result}")
+    if "sent" in result.lower():
+        _log.info(result)
+    else:
+        _log.warning(result)
     if player:
         player.write_log(f"[msg] {result}")
 

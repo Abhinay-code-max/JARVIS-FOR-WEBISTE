@@ -3,11 +3,14 @@ MARK XL — Error Handler
 Replaces google.generativeai with local Ollama via core.llm_client.
 """
 import json
+import logging
 import re
 from enum import Enum
 
 from core.llm_client import call_llm_text
 from config import BASE_DIR
+
+_log = logging.getLogger("jarvis.error_handler")
 
 
 class ErrorDecision(Enum):
@@ -43,9 +46,10 @@ def analyze_error(
     error:        str,
     attempt:      int = 1,
     max_attempts: int = 2,
+    task_id:      str | None = None,
 ) -> dict:
     if attempt >= max_attempts:
-        print(f"[ErrorHandler] ⚠️ Max attempts for step {step.get('step')} — forcing replan")
+        _log.warning("Max attempts for step %s — forcing replan", step.get('step'))
         return {
             "decision":       ErrorDecision.REPLAN,
             "reason":         f"Failed {attempt} times: {error[:100]}",
@@ -66,7 +70,10 @@ Error:
 Attempt number: {attempt}"""
 
     try:
-        text   = call_llm_text(prompt, system=ERROR_ANALYST_PROMPT)
+        text   = call_llm_text(
+            prompt, system=ERROR_ANALYST_PROMPT,
+            task_id=task_id, step_num=step.get("step"), purpose="analyze error",
+        )
         text   = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
         result = json.loads(text)
 
@@ -83,11 +90,11 @@ Attempt number: {attempt}"""
             result["decision"]     = ErrorDecision.REPLAN
             result["user_message"] = "This step is critical — finding alternative approach, sir."
 
-        print(f"[ErrorHandler] Decision: {result['decision'].value} — {result.get('reason', '')}")
+        _log.info("Decision: %s — %s", result['decision'].value, result.get('reason', ''))
         return result
 
     except Exception as e:
-        print(f"[ErrorHandler] ⚠️ Analysis failed: {e} — defaulting to replan")
+        _log.warning("Analysis failed: %s — defaulting to replan", e)
         return {
             "decision":       ErrorDecision.REPLAN,
             "reason":         str(e),
@@ -97,7 +104,7 @@ Attempt number: {attempt}"""
         }
 
 
-def generate_fix(step: dict, error: str, fix_suggestion: str) -> dict:
+def generate_fix(step: dict, error: str, fix_suggestion: str, task_id: str | None = None) -> dict:
     prompt = f"""A task step failed. Generate a replacement step.
 
 Original step:
@@ -112,7 +119,10 @@ Write a Python script that accomplishes the same goal differently.
 Return ONLY the Python code, no explanation."""
 
     try:
-        code = call_llm_text(prompt)
+        code = call_llm_text(
+            prompt,
+            task_id=task_id, step_num=step.get("step"), purpose="generate fix",
+        )
         code = re.sub(r"```(?:python)?", "", code).strip().rstrip("`").strip()
         return {
             "step":        step.get("step"),
@@ -128,5 +138,5 @@ Return ONLY the Python code, no explanation."""
             "critical":   step.get("critical", False),
         }
     except Exception as e:
-        print(f"[ErrorHandler] ⚠️ Fix generation failed: {e}")
+        _log.warning("Fix generation failed: %s", e)
         raise RuntimeError(f"Could not generate a fix: {e}")

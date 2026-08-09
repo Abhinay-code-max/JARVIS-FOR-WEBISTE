@@ -5,6 +5,9 @@ import time
 import subprocess
 import platform
 from pathlib import Path
+import logging
+
+_log = logging.getLogger("jarvis.computer_settings")
 
 try:
     import pyautogui
@@ -86,7 +89,7 @@ def volume_set(value: int):
             vol.SetMasterVolumeLevel(vol_db, None)
             return
         except Exception as e:
-            print(f"[Settings] pycaw failed, using keypress fallback: {e}")
+            _log.warning(f"pycaw failed, using keypress fallback: {e}")
             pyautogui.press("volumemute")
             pyautogui.press("volumemute")
     elif _OS == "Darwin":
@@ -125,7 +128,7 @@ def brightness_up():
                 capture_output=True, timeout=5
             )
         except Exception as e:
-            print(f"[Settings] Brightness up failed on Windows: {e}")
+            _log.warning(f"Brightness up failed on Windows: {e}")
 
 def brightness_down():
     if _OS == "Darwin":
@@ -154,7 +157,7 @@ def brightness_down():
                 capture_output=True, timeout=5
             )
         except Exception as e:
-            print(f"[Settings] Brightness down failed on Windows: {e}")
+            _log.warning(f"Brightness down failed on Windows: {e}")
 
 def close_app():
     if _OS == "Darwin": pyautogui.hotkey("command", "q")
@@ -400,7 +403,7 @@ def sleep_display():
             import ctypes
             ctypes.windll.user32.SendMessageW(0xFFFF, 0x0112, 0xF170, 2)
         except Exception as e:
-            print(f"[Settings] sleep_display failed: {e}")
+            _log.warning(f"sleep_display failed: {e}")
     elif _OS == "Darwin":
         subprocess.run(["pmset", "displaysleepnow"], capture_output=True)
     else:
@@ -426,7 +429,7 @@ def dark_mode():
             winreg.SetValueEx(key, "SystemUsesLightTheme", 0, winreg.REG_DWORD, 1 - current)
             winreg.CloseKey(key)
         except Exception as e:
-            print(f"[Settings] dark_mode registry failed: {e}")
+            _log.warning(f"dark_mode registry failed: {e}")
     else:
         try:
             result = subprocess.run(
@@ -440,7 +443,7 @@ def dark_mode():
                 capture_output=True
             )
         except Exception as e:
-            print(f"[Settings] dark_mode Linux failed: {e}")
+            _log.warning(f"dark_mode Linux failed: {e}")
 
 def toggle_wifi():
     if _OS == "Darwin":
@@ -462,14 +465,14 @@ def toggle_wifi():
                 capture_output=True, timeout=10
             )
         except Exception as e:
-            print(f"[Settings] toggle_wifi Windows failed: {e}")
+            _log.warning(f"toggle_wifi Windows failed: {e}")
     else:
         try:
             result = subprocess.run(["nmcli", "radio", "wifi"], capture_output=True, text=True)
             state  = "off" if "enabled" in result.stdout else "on"
             subprocess.run(["nmcli", "radio", "wifi", state], capture_output=True)
         except Exception as e:
-            print(f"[Settings] toggle_wifi Linux failed: {e}")
+            _log.warning(f"toggle_wifi Linux failed: {e}")
 
 def restart_computer():
     if _OS == "Windows":
@@ -578,7 +581,7 @@ def _detect_action(description: str) -> dict:
         text = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
         return json.loads(text)
     except Exception as e:
-        print(f"[Settings] Intent detection failed: {e}")
+        _log.warning(f"Intent detection failed: {e}")
         return {"action": description.lower().replace(" ", "_"), "value": None}
 
 def computer_settings(
@@ -606,7 +609,7 @@ def computer_settings(
     if not action:
         return "No action could be determined."
 
-    print(f"[Settings] Action: {action}  Value: {value}  OS: {_OS}")
+    _log.debug(f"Action: {action}  Value: {value}  OS: {_OS}")
     if player:
         player.write_log(f"[Settings] {action}")
 
@@ -663,5 +666,5 @@ def computer_settings(
         func()
         return f"Done: {action}."
     except Exception as e:
-        print(f"[Settings] Action failed ({action}): {e}")
+        _log.warning(f"Action failed ({action}): {e}")
         return f"Action failed ({action}): {e}"

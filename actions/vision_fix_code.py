@@ -39,6 +39,9 @@ except ImportError:
 
 from config import load_config as _load_config, BASE_DIR
 from core.llm_client import call_llm_text as _llm_text, call_llm_vision as _llm_vision
+import logging
+
+_log = logging.getLogger("jarvis.vision_fix_code")
 
 
 def _capture_screen() -> bytes:
@@ -187,7 +190,7 @@ Output ONLY the complete corrected file content. No markdown fences, no explanat
         fixed = re.sub(r"\n```$", "", fixed)
         return fixed.strip()
     except Exception as e:
-        print(f"[VisionFixCode] LLM fix error: {e}")
+        _log.warning(f"LLM fix error: {e}")
         return None
 
 
@@ -196,7 +199,7 @@ def vision_fix_code(parameters: dict = None, player=None, speak=None) -> str:
     config = _load_config()
 
     def _log(msg: str):
-        print(f"[VisionFixCode] {msg}")
+        _log.debug(f"{msg}")
         if player:
             try:
                 player.write_log(f"[fix] {msg}")

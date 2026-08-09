@@ -20,6 +20,14 @@ if hasattr(_sys.stdout, "reconfigure"):
 if hasattr(_sys.stderr, "reconfigure"):
     _sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+# ── Structured logging — configured before anything else so every module
+#    (including the two bootstrap prints just below, which are a
+#    deliberate exception — see the comment at _bootstrap()) can use it
+#    from the moment it's imported. Stdlib-only; safe before _bootstrap()
+#    installs anything. ────────────────────────────────────────────────────
+from core.logging_setup import init_logging
+init_logging()
+
 # ── Silence verbose logs ────────────────────────────────────────────────────
 import os as _os
 _os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL",  "3")
@@ -50,6 +58,14 @@ _BASE_PKGS = [
 ]
 
 def _bootstrap() -> None:
+    # Deliberately left as print(), not logging: os.execv() below replaces
+    # the process image within milliseconds of the second message — there's
+    # no guarantee the QueueListener's background thread gets scheduled to
+    # drain the queue (console or DB) before that happens, so a logger call
+    # here risks the message silently never appearing at all. The only
+    # audience for this message is a developer watching the terminal during
+    # first-run setup; print() guarantees they actually see it before the
+    # restart.
     need = [pkg for mod, pkg in _BASE_PKGS if _ilu.find_spec(mod) is None]
     if not need:
         return
@@ -62,12 +78,12 @@ _bootstrap()
 
 # ── Standard imports ─────────────────────────────────────────────────────────
 import json
+import logging
 import queue
 import re
 import sys
 import threading
 import time
-import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -84,6 +100,9 @@ from recognition.wake_word import WakeWordDetector
 from core.tool_dispatch import TOOL_DISPATCH
 from core.confirm import CONFIRM
 from config import load_config, BASE_DIR
+
+_log      = logging.getLogger("jarvis.main")
+_wake_log = logging.getLogger("jarvis.wakeword")
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
@@ -763,7 +782,7 @@ class JarvisXL:
                     self.ui.set_state("SPEAKING")
                     self._tts.speak(text)
             except Exception as e:
-                print(f"[TTS] {e}")
+                _log.error("TTS playback error: %s", e)
             finally:
                 self._tts_queue.task_done()
                 if self._tts_queue.empty():
@@ -808,7 +827,7 @@ class JarvisXL:
             try:
                 self._tts.stop()
             except Exception as e:
-                print(f"[BargeIn] tts.stop() failed: {e}")
+                _log.warning("Barge-in: tts.stop() failed: %s", e)
 
         # Drop any sentences still queued from the interrupted response —
         # otherwise the TTS worker would just move on to the next one right
@@ -839,7 +858,7 @@ class JarvisXL:
         alongside whichever STT engine is active). This callback is wired
         for when that's added later; it's inert until then."""
         self._wake_until = time.time() + self.WAKE_WINDOW_SEC
-        print("[WakeWord] Wake word detected (streaming mode).")
+        _wake_log.info("Wake word detected (streaming mode).")
 
     def _wake_gate(self, text: str) -> str | None:
         """Wake-word gate for mic-derived transcriptions (default
@@ -862,14 +881,18 @@ class JarvisXL:
             # refreshes the awake window like a normal wake-word hit would).
             self._barge_in_pending = False
             self._wake_until = time.time() + self.WAKE_WINDOW_SEC
+            _wake_log.debug("Gate: barge-in bypass, window extended")
             return text
         now = time.time()
         if now < self._wake_until:
             self._wake_until = now + self.WAKE_WINDOW_SEC
+            _wake_log.debug("Gate: within awake window, pass-through")
             return text
         if not self._wake.check(text):
+            _wake_log.debug("Gate: no wake word, dropped: %r", text)
             return None
         self._wake_until = now + self.WAKE_WINDOW_SEC
+        _wake_log.info("Gate: wake word matched, window opened")
         stripped = self._wake.strip_wake_word(text)
         return stripped if stripped.strip() else None
 
@@ -894,7 +917,7 @@ class JarvisXL:
             now = time.time()
             if (normalized == self._last_produced_text
                     and (now - self._last_produced_time) < self._dedup_window_sec):
-                print(f"[Dedup] Ignored duplicate at producer: {text!r}")
+                _log.debug("Dedup: ignored duplicate at producer: %r", text)
                 return
             self._last_produced_text = normalized
             self._last_produced_time = now
@@ -948,7 +971,7 @@ class JarvisXL:
 
     # ── Tool execution ────────────────────────────────────────────────────────
     def _execute_tool(self, name: str, args: dict) -> str:
-        print(f"[JARVIS-XL] 🔧 {name}  {args}")
+        _log.info("Tool call: %s %r", name, args)
         self.ui.set_state("THINKING")
 
         if name == "save_memory":
@@ -957,7 +980,7 @@ class JarvisXL:
             value    = args.get("value", "")
             if key and value:
                 update_memory({category: {key: {"value": value}}})
-                print(f"[Memory] 💾 {category}/{key} = {value}")
+                logging.getLogger("jarvis.memory").info("%s/%s = %s", category, key, value)
                 # Auto-update current user if name is saved
                 if category == "identity" and key == "name":
                     self._current_user = value
@@ -1027,7 +1050,7 @@ class JarvisXL:
 
         except Exception as e:
             result = f"Tool '{name}' failed: {e}"
-            traceback.print_exc()
+            _log.error("Tool '%s' failed: %s", name, e, exc_info=True)
             self.speak_error(name, e)
 
         if not self.ui.muted:
@@ -1060,7 +1083,7 @@ class JarvisXL:
             _streamed: list[str]   = []
 
             try:
-                for event in call_llm_stream(messages, OLLAMA_TOOLS):
+                for event in call_llm_stream(messages, OLLAMA_TOOLS, purpose="conversation turn"):
                     if event["type"] == "sentence":
                         _streamed.append(event["text"])
                         self.speak(event["text"])
@@ -1138,6 +1161,7 @@ class JarvisXL:
                     {"role": "user", "content": summary_prompt},
                 ],
                 tools=[],
+                purpose="auto-summarise conversation",
             )
             summary_text = summary_response.get("content", "").strip()
             if not summary_text:
@@ -1290,7 +1314,7 @@ class JarvisXL:
 
                 if (normalized == self._last_command_text
                         and (now - self._last_command_time) < self._dedup_window_sec):
-                    print(f"[Dedup] Skipped duplicate at consumer: {text!r}")
+                    _log.debug("Dedup: skipped duplicate at consumer: %r", text)
                     continue
 
                 self._last_command_text = normalized
@@ -1418,7 +1442,7 @@ class JarvisXL:
                     if not self._current_user:
                         self.speak("JARVIS online. I don't recognise you yet — please introduce yourself.")
                 except Exception as e:
-                    import traceback as _tb; _tb.print_exc()
+                    _log.error("TTS startup failed: %s", e, exc_info=True)
                     self.ui.write_log(f"ERR: TTS — {e}")
                     self.ui.mark_startup_ready("tts", error=True)
                     self._tts_ready.set()
@@ -1444,7 +1468,7 @@ class JarvisXL:
 
         except Exception as e:
             self.ui.write_log(f"ERR: Init failed — {e}")
-            traceback.print_exc()
+            _log.error("Init failed: %s", e, exc_info=True)
 
 
 # ── Entry ─────────────────────────────────────────────────────────────────────
@@ -1480,6 +1504,12 @@ def main() -> None:
         try:
             jarvis.run()
         except KeyboardInterrupt:
+            # print(), not logging: the QueueListener thread is a daemon
+            # thread (see core/logging_setup.py) — on interpreter shutdown
+            # right after this it may never get scheduled to drain the
+            # queue, so a logger call here has a real chance of never
+            # appearing anywhere. This message's only audience is a
+            # terminal-watching developer; print() guarantees it's seen.
             print("\n[JARVIS-XL] Shutting down…")
 
     threading.Thread(target=runner, daemon=True).start()

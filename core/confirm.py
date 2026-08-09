@@ -17,10 +17,13 @@ blocking DB I/O there is safe. answer(), by contrast, IS called directly
 from the audio/transcript threads (via main.py's _enqueue_command): it
 must stay free of any DB or other I/O, full stop.
 """
+import logging
 import threading
 import time
 
 from core.db import get_conn
+
+_log = logging.getLogger("jarvis.confirm")
 
 _YES = {"yes", "y", "yeah", "yep", "yup", "confirm", "run it", "do it", "go ahead", "sure", "ok", "okay"}
 _NO  = {"no", "n", "nope", "nah", "cancel", "stop", "don't", "dont", "abort"}
@@ -65,7 +68,7 @@ class _ConfirmationGate:
                     (prompt, requested_at, requested_at, outcome),
                 )
         except Exception as e:
-            print(f"[Confirm] ⚠️ Could not log approval: {e}")
+            _log.warning("Could not log approval: %s", e)
 
     def request(self, player, prompt: str, speak=None, timeout: float = 45.0) -> bool:
         """Blocking. Shows `prompt`, waits for a yes/no answer (or the
@@ -87,7 +90,7 @@ class _ConfirmationGate:
                 )
                 approval_id = cur.lastrowid
         except Exception as e:
-            print(f"[Confirm] ⚠️ Could not log approval request: {e}")
+            _log.warning("Could not log approval request: %s", e)
 
         def _finish(outcome: str) -> None:
             if approval_id is None:
@@ -100,7 +103,7 @@ class _ConfirmationGate:
                         (time.time(), outcome, approval_id),
                     )
             except Exception as e:
-                print(f"[Confirm] ⚠️ Could not log approval outcome: {e}")
+                _log.warning("Could not log approval outcome: %s", e)
 
         with self._lock:
             self._pending = True
@@ -120,10 +123,13 @@ class _ConfirmationGate:
                 with self._lock:
                     self._pending = False
                 player.write_log("CONFIRM: no response — treating as cancelled.")
+                _log.warning("Approval timed out: %s", prompt[:120])
                 _finish("timeout")
                 return False
 
             player.write_log(f"CONFIRM: {'proceeding' if answer else 'cancelled'}.")
+            if not answer:
+                _log.warning("Approval denied: %s", prompt[:120])
             _finish("approved" if answer else "denied")
             return answer
         finally:

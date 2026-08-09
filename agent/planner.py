@@ -3,11 +3,14 @@ MARK XL — Task Planner
 Replaces google.generativeai with local Ollama via core.llm_client.
 """
 import json
+import logging
 import re
 
 from core.llm_client import call_llm_text
 from core.tool_dispatch import TOOL_DISPATCH
 from config import BASE_DIR
+
+_log = logging.getLogger("jarvis.planner")
 
 # Tool names _call_tool() actually knows how to run. Any step whose "tool"
 # isn't in this set (or the literal "generated_code", handled separately
@@ -130,13 +133,16 @@ OUTPUT — return ONLY valid JSON, no markdown, no explanation, no code blocks:
 """
 
 
-def create_plan(goal: str, context: str = "") -> dict:
+def create_plan(goal: str, context: str = "", task_id: str | None = None) -> dict:
     user_input = f"Goal: {goal}"
     if context:
         user_input += f"\n\nContext: {context}"
 
     try:
-        text = call_llm_text(user_input, system=PLANNER_PROMPT)
+        text = call_llm_text(
+            user_input, system=PLANNER_PROMPT,
+            task_id=task_id, purpose="create plan",
+        )
         text = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
 
         plan = json.loads(text)
@@ -146,29 +152,29 @@ def create_plan(goal: str, context: str = "") -> dict:
         for step in plan["steps"]:
             tool = step.get("tool")
             if tool == "generated_code":
-                print(f"[Planner] ⚠️ generated_code in step {step.get('step')} — replacing with web_search")
+                _log.warning("generated_code in step %s — replacing with web_search", step.get('step'))
                 step["tool"]       = "web_search"
                 step["parameters"] = {"query": step.get("description", goal)[:200]}
             elif tool not in _VALID_TOOLS:
-                print(f"[Planner] ⚠️ Unknown tool '{tool}' in step {step.get('step')} — replacing with web_search")
+                _log.warning("Unknown tool '%s' in step %s — replacing with web_search", tool, step.get('step'))
                 step["tool"]       = "web_search"
                 step["parameters"] = {"query": step.get("description", goal)[:200]}
 
-        print(f"[Planner] ✅ Plan: {len(plan['steps'])} steps")
+        _log.debug("Plan: %d steps", len(plan['steps']))
         for s in plan["steps"]:
-            print(f"  Step {s['step']}: [{s['tool']}] {s['description']}")
+            _log.debug("  Step %s: [%s] %s", s['step'], s['tool'], s['description'])
         return plan
 
     except json.JSONDecodeError as e:
-        print(f"[Planner] ⚠️ JSON parse failed: {e}")
+        _log.warning("JSON parse failed: %s", e)
         return _fallback_plan(goal)
     except Exception as e:
-        print(f"[Planner] ⚠️ Planning failed: {e}")
+        _log.warning("Planning failed: %s", e)
         return _fallback_plan(goal)
 
 
 def _fallback_plan(goal: str) -> dict:
-    print("[Planner] 🔄 Fallback plan")
+    _log.info("Fallback plan")
     return {
         "goal":  goal,
         "steps": [
@@ -183,7 +189,7 @@ def _fallback_plan(goal: str) -> dict:
     }
 
 
-def replan(goal: str, completed_steps: list, failed_step: dict, error: str) -> dict:
+def replan(goal: str, completed_steps: list, failed_step: dict, error: str, task_id: str | None = None) -> dict:
     completed_summary = "\n".join(
         f"  - Step {s['step']} ({s['tool']}): DONE" for s in completed_steps
     )
@@ -198,7 +204,10 @@ Error: {error}
 Create a REVISED plan for the remaining work only. Do not repeat completed steps."""
 
     try:
-        text = call_llm_text(prompt, system=PLANNER_PROMPT)
+        text = call_llm_text(
+            prompt, system=PLANNER_PROMPT,
+            task_id=task_id, purpose="replan",
+        )
         text = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
         plan = json.loads(text)
 
@@ -208,12 +217,12 @@ Create a REVISED plan for the remaining work only. Do not repeat completed steps
                 step["tool"]       = "web_search"
                 step["parameters"] = {"query": step.get("description", goal)[:200]}
             elif tool not in _VALID_TOOLS:
-                print(f"[Planner] ⚠️ Unknown tool '{tool}' in step {step.get('step')} — replacing with web_search")
+                _log.warning("Unknown tool '%s' in step %s — replacing with web_search", tool, step.get('step'))
                 step["tool"]       = "web_search"
                 step["parameters"] = {"query": step.get("description", goal)[:200]}
 
-        print(f"[Planner] 🔄 Revised plan: {len(plan['steps'])} steps")
+        _log.debug("Revised plan: %d steps", len(plan['steps']))
         return plan
     except Exception as e:
-        print(f"[Planner] ⚠️ Replan failed: {e}")
+        _log.warning("Replan failed: %s", e)
         return _fallback_plan(goal)

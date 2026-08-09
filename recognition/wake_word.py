@@ -12,10 +12,13 @@ Supported wake phrases (case-insensitive):
 """
 
 from __future__ import annotations
+import logging
 import os
 import re
 import threading
 from typing import Callable, Optional
+
+_log = logging.getLogger("jarvis.wakeword")
 
 _WAKE_PATTERNS = [
     r"\bhey\s+jarvis\b",
@@ -49,11 +52,11 @@ class WakeWordDetector:
             from openwakeword.model import Model
             self._oww  = Model(wakeword_models=["hey_jarvis"])
             self._mode = "streaming"
-            print("[WakeWord] openwakeword loaded (streaming mode).")
+            _log.info("openwakeword loaded (streaming mode).")
         except ImportError:
-            print("[WakeWord] openwakeword not available — using transcription mode.")
+            _log.info("openwakeword not available — using transcription mode.")
         except Exception as e:
-            print(f"[WakeWord] openwakeword error: {e}")
+            _log.warning("openwakeword error: %s", e)
 
     # ── Transcription mode ────────────────────────────────────────────────────
     def check(self, text: str) -> bool:

@@ -1,6 +1,9 @@
 import requests
 
 from config import load_config
+import logging
+
+_log = logging.getLogger("jarvis.weather")
 
 
 def _get_api_key() -> str:
@@ -8,7 +11,7 @@ def _get_api_key() -> str:
 
 
 def _log(msg: str, player=None) -> None:
-    print(f"[Weather] {msg}")
+    _log.debug(f"{msg}")
     if player:
         try:
             player.write_log(f"[weather] {msg}")

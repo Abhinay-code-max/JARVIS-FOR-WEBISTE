@@ -17,6 +17,7 @@ Supports two backends — selected via  "llm_provider"  in config/api_keys.json:
         supports function/tool calls (e.g. Qwen2.5, Llama-3.1, Mistral).
 """
 import json
+import logging
 import re
 import subprocess
 import sys
@@ -26,6 +27,9 @@ from typing import Generator
 import requests
 
 from config import load_config as _load_config
+from core.db import log_task_event
+
+_log = logging.getLogger("jarvis.llm")
 
 # Matches a sentence boundary: [.!?] followed by whitespace, or a blank line.
 # Avoids splitting on decimals (3.5) because those have no space after the dot.
@@ -36,6 +40,37 @@ _DEFAULTS = {
     "llm_model":    "llama3.2",
     "llm_provider": "ollama",   # "ollama" | "openai"
 }
+
+
+def _elapsed_ms(start: float) -> int:
+    return int((time.monotonic() - start) * 1000)
+
+
+def _log_llm_outcome(
+    task_id:     str | None,
+    step_num,
+    purpose:     str,
+    status:      str,
+    duration_ms: int,
+    detail:      str = "",
+) -> None:
+    """Records one LLM call's outcome. Callers with a task_id in scope
+    (planner/executor/error_handler — all task-scoped) land in
+    task_events as tool='llm', alongside the step timeline. Callers with
+    no task_id (the live conversation loop, and any LLM call made from
+    inside a TOOL_DISPATCH tool — task_id isn't threaded through tool
+    calls in this phase, see the logging-phase plan) land in log_events
+    instead, via the general logger."""
+    if task_id:
+        log_task_event(task_id, step_num, "llm", purpose, status, detail, duration_ms)
+        return
+    extra = {"duration_ms": duration_ms}
+    if detail:
+        extra["detail"] = detail
+    if status == "failed":
+        _log.error("LLM call failed: %s", purpose, extra=extra)
+    else:
+        _log.info("LLM call: %s", purpose, extra=extra)
 
 
 def get_llm_provider() -> str:
@@ -60,14 +95,14 @@ def ensure_ollama_running(timeout: int = 15) -> bool:
         try:
             ok = requests.get(health, timeout=5).status_code == 200
             if ok:
-                print(f"[LLM] OpenAI-compatible server reachable at {url}")
+                _log.info("OpenAI-compatible server reachable at %s", url)
             else:
-                print(f"[LLM] Server at {url} returned non-200.  Is it running?")
+                _log.warning("Server at %s returned non-200. Is it running?", url)
             return ok
         except Exception as e:
-            print(
-                f"[LLM] Cannot reach OpenAI-compatible server at {url}.\n"
-                "      Make sure LM Studio / LocalAI / Jan is running and the server is started."
+            _log.warning(
+                "Cannot reach OpenAI-compatible server at %s — make sure LM Studio / "
+                "LocalAI / Jan is running and the server is started: %s", url, e,
             )
             return False
 
@@ -83,27 +118,27 @@ def ensure_ollama_running(timeout: int = 15) -> bool:
     if _is_up():
         return True
 
-    print("[LLM] Ollama not running — launching 'ollama serve'…")
+    _log.info("Ollama not running — launching 'ollama serve'…")
     try:
         kwargs: dict = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
         if sys.platform == "win32":
             kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
         subprocess.Popen(["ollama", "serve"], **kwargs)
     except FileNotFoundError:
-        print("[LLM] 'ollama' command not found. Install Ollama from https://ollama.com")
+        _log.error("'ollama' command not found. Install Ollama from https://ollama.com")
         return False
     except Exception as e:
-        print(f"[LLM] Could not launch Ollama: {e}")
+        _log.error("Could not launch Ollama: %s", e)
         return False
 
     deadline = time.time() + timeout
     while time.time() < deadline:
         time.sleep(1.0)
         if _is_up():
-            print("[LLM] Ollama started successfully.")
+            _log.info("Ollama started successfully.")
             return True
 
-    print("[LLM] Ollama did not respond within the timeout.")
+    _log.error("Ollama did not respond within the timeout.")
     return False
 
 
@@ -124,7 +159,7 @@ def warmup_model(system_prompt: str | None = None) -> bool:
     """
     url, model = get_llm_settings()
     provider   = get_llm_provider()
-    print(f"[LLM] Warming up '{model}' ({provider})…")
+    _log.info("Warming up '%s' (%s)…", model, provider)
 
     messages: list[dict] = []
     if system_prompt:
@@ -143,10 +178,10 @@ def warmup_model(system_prompt: str | None = None) -> bool:
         try:
             resp = requests.post(f"{url}/v1/chat/completions", json=payload, timeout=180)
             resp.raise_for_status()
-            print(f"[LLM] '{model}' ready (OpenAI-compatible server).")
+            _log.info("'%s' ready (OpenAI-compatible server).", model)
             return True
         except Exception as e:
-            print(f"[LLM] Warmup failed (non-fatal): {e}")
+            _log.warning("Warmup failed (non-fatal): %s", e)
             return False
 
     # ── Ollama ──────────────────────────────────────────────────────────────
@@ -162,10 +197,10 @@ def warmup_model(system_prompt: str | None = None) -> bool:
     try:
         resp = requests.post(f"{url}/api/chat", json=payload, timeout=180)
         resp.raise_for_status()
-        print(f"[LLM] '{model}' loaded and KV cache primed.")
+        _log.info("'%s' loaded and KV cache primed.", model)
         return True
     except Exception as e:
-        print(f"[LLM] Warmup failed (non-fatal): {e}")
+        _log.warning("Warmup failed (non-fatal): %s", e)
         return False
 
 
@@ -181,13 +216,34 @@ def call_llm(
     messages: list,
     tools:    list | None = None,
     timeout:  int = 120,
+    task_id:  str | None = None,
+    step_num                = None,
+    purpose:  str = "chat",
 ) -> dict:
     """
     Non-streaming chat request.  Routes to Ollama or OpenAI-compatible backend.
+    Pass task_id/step_num when calling from inside a task-scoped context
+    (AgentExecutor et al.) so the call's outcome+duration lands in
+    task_events; otherwise it lands in log_events with task_id=NULL.
 
     Returns:
         {"content": str, "tool_calls": list}
     """
+    start = time.monotonic()
+    try:
+        result = _call_llm_impl(messages, tools, timeout)
+        _log_llm_outcome(task_id, step_num, purpose, "done", _elapsed_ms(start))
+        return result
+    except Exception as e:
+        _log_llm_outcome(task_id, step_num, purpose, "failed", _elapsed_ms(start), str(e))
+        raise
+
+
+def _call_llm_impl(
+    messages: list,
+    tools:    list | None = None,
+    timeout:  int = 120,
+) -> dict:
     url, model = get_llm_settings()
     provider   = get_llm_provider()
 
@@ -258,7 +314,7 @@ def call_llm(
             "tool_calls": msg.get("tool_calls") or [],
         }
     except requests.exceptions.ConnectionError as e:
-        print(f"[LLM] ConnectionError — trying to restart Ollama… ({e})")
+        _log.warning("ConnectionError — trying to restart Ollama… (%s)", e)
         if ensure_ollama_running():
             try:
                 resp = requests.post(endpoint, json=payload, timeout=timeout)
@@ -278,10 +334,10 @@ def call_llm(
     except requests.exceptions.Timeout:
         raise RuntimeError("Ollama request timed out after 120 s.")
     except requests.exceptions.HTTPError as e:
-        print(f"[LLM] HTTPError: {e.response.status_code} — {e.response.text[:200]}")
+        _log.error("HTTPError: %s — %s", e.response.status_code, e.response.text[:200])
         raise RuntimeError(f"Ollama HTTP error: {e.response.status_code}")
     except Exception as e:
-        print(f"[LLM] Unexpected error: {type(e).__name__}: {e}")
+        _log.error("Unexpected error: %s: %s", type(e).__name__, e)
         raise RuntimeError(f"LLM call failed: {e}")
 
 
@@ -290,11 +346,32 @@ def call_llm_text(
     system:  str | None = None,
     model:   str | None = None,
     timeout: int = 120,
+    task_id: str | None = None,
+    step_num             = None,
+    purpose: str = "text generation",
 ) -> str:
     """
     Simple text-only generation (no tools).
     Used by planner, executor, error_handler, code_helper, dev_agent.
+    Pass task_id/step_num when calling from a task-scoped context — see
+    call_llm's docstring.
     """
+    start = time.monotonic()
+    try:
+        result = _call_llm_text_impl(prompt, system, model, timeout)
+        _log_llm_outcome(task_id, step_num, purpose, "done", _elapsed_ms(start))
+        return result
+    except Exception as e:
+        _log_llm_outcome(task_id, step_num, purpose, "failed", _elapsed_ms(start), str(e))
+        raise
+
+
+def _call_llm_text_impl(
+    prompt:  str,
+    system:  str | None = None,
+    model:   str | None = None,
+    timeout: int = 120,
+) -> str:
     url, default_model = get_llm_settings()
     endpoint = f"{url}/api/chat"
     m        = model or default_model
@@ -332,13 +409,34 @@ def call_llm_vision(
     system:      str | None = None,
     model:       str | None = None,
     timeout:     int = 120,
+    task_id:     str | None = None,
+    step_num                 = None,
+    purpose:     str = "vision",
 ) -> str:
     """
     Single-image vision generation via Ollama's /api/chat "images" field
     (base64-encoded). Requires a vision-capable model — config key
     "vision_model", default "qwen2.5vl:7b". Ollama-only: this codebase has
-    no OpenAI-compatible vision path configured.
+    no OpenAI-compatible vision path configured. Pass task_id/step_num
+    when calling from a task-scoped context — see call_llm's docstring.
     """
+    start = time.monotonic()
+    try:
+        result = _call_llm_vision_impl(prompt, image_bytes, system, model, timeout)
+        _log_llm_outcome(task_id, step_num, purpose, "done", _elapsed_ms(start))
+        return result
+    except Exception as e:
+        _log_llm_outcome(task_id, step_num, purpose, "failed", _elapsed_ms(start), str(e))
+        raise
+
+
+def _call_llm_vision_impl(
+    prompt:      str,
+    image_bytes: bytes,
+    system:      str | None = None,
+    model:       str | None = None,
+    timeout:     int = 120,
+) -> str:
     import base64
     cfg = _load_config()
     url = cfg.get("llm_url", _DEFAULTS["llm_url"]).rstrip("/")
@@ -492,9 +590,16 @@ def call_llm_stream(
     messages: list,
     tools:    list | None = None,
     timeout:  int = 120,
+    task_id:  str | None = None,
+    step_num                = None,
+    purpose:  str = "chat stream",
 ) -> Generator[dict, None, None]:
     """
     Streaming chat request.  Routes to Ollama or OpenAI-compatible backend.
+    Pass task_id/step_num when calling from a task-scoped context — see
+    call_llm's docstring. The vast majority of calls to this function come
+    from main.py's live conversation loop, which has no task_id at all —
+    those log to log_events instead.
 
     Yields:
         {"type": "sentence", "text": str}   — each complete sentence as it arrives
@@ -503,6 +608,21 @@ def call_llm_stream(
     Sentences are split on [.!?] + whitespace so TTS can start immediately.
     Tool calls always appear in the final "done" event.
     """
+    start = time.monotonic()
+    try:
+        for event in _call_llm_stream_impl(messages, tools, timeout):
+            yield event
+        _log_llm_outcome(task_id, step_num, purpose, "done", _elapsed_ms(start))
+    except Exception as e:
+        _log_llm_outcome(task_id, step_num, purpose, "failed", _elapsed_ms(start), str(e))
+        raise
+
+
+def _call_llm_stream_impl(
+    messages: list,
+    tools:    list | None = None,
+    timeout:  int = 120,
+) -> Generator[dict, None, None]:
     provider = get_llm_provider()
     if provider == "openai":
         yield from _stream_openai(messages, tools, timeout)
@@ -578,7 +698,7 @@ def call_llm_stream(
     try:
         yield from _do_stream()
     except requests.exceptions.ConnectionError as e:
-        print(f"[LLM] Stream ConnectionError — trying to restart Ollama… ({e})")
+        _log.warning("Stream ConnectionError — trying to restart Ollama… (%s)", e)
         if ensure_ollama_running():
             yield from _do_stream()
             return
@@ -591,5 +711,5 @@ def call_llm_stream(
     except requests.exceptions.HTTPError as e:
         raise RuntimeError(f"Ollama HTTP error: {e.response.status_code}")
     except Exception as e:
-        print(f"[LLM] Stream error: {type(e).__name__}: {e}")
+        _log.error("Stream error: %s: %s", type(e).__name__, e)
         raise RuntimeError(f"LLM stream failed: {e}")

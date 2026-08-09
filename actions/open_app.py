@@ -2,6 +2,9 @@ import time
 import subprocess
 import platform
 import shutil
+import logging
+
+_log = logging.getLogger("jarvis.open_app")
 
 try:
     import psutil
@@ -93,7 +96,7 @@ def _launch_windows(app_name: str) -> bool:
             time.sleep(0.8)
             return True
         except Exception as e:
-            print(f"[open_app] subprocess failed: {e}")
+            _log.warning(f"subprocess failed: {e}")
 
     if ":" in app_name:
         try:
@@ -122,7 +125,7 @@ def _launch_windows(app_name: str) -> bool:
         time.sleep(1.2)
         return True
     except Exception as e:
-        print(f"[open_app] Start Menu search failed: {e}")
+        _log.warning(f"Start Menu search failed: {e}")
 
     return False
 
@@ -174,7 +177,7 @@ def _launch_macos(app_name: str) -> bool:
         time.sleep(0.8)
         return True
     except Exception as e:
-        print(f"[open_app] Spotlight failed: {e}")
+        _log.warning(f"Spotlight failed: {e}")
 
     return False
 
@@ -248,7 +251,7 @@ def open_app(
         return f"Unsupported operating system: {_SYSTEM}"
 
     normalized = _normalize(app_name)
-    print(f"[open_app] Launching: '{app_name}' → '{normalized}' ({_SYSTEM})")
+    _log.debug(f"Launching: '{app_name}' → '{normalized}' ({_SYSTEM})")
 
     if player:
         player.write_log(f"[open_app] {app_name}")
@@ -264,5 +267,5 @@ def open_app(
             f"It may still be loading, or it might not be installed."
         )
     except Exception as e:
-        print(f"[open_app] Error: {e}")
+        _log.warning(f"Error: {e}")
         return f"Failed to open {app_name}: {e}"

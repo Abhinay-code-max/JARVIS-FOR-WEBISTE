@@ -8,6 +8,9 @@ import tempfile
 import platform
 from pathlib import Path
 from datetime import datetime
+import logging
+
+_log = logging.getLogger("jarvis.desktop")
 
 try:
     import pyautogui
@@ -96,7 +99,7 @@ def _execute_generated_code(code: str, player=None, speak=None) -> str:
         exec(compile(code, "<jarvis_desktop>", "exec"), sandbox)
         return "\n".join(output_lines) if output_lines else "Done."
     except Exception as e:
-        print(f"[Desktop] Exec error: {e}\nCode:\n{code[:300]}")
+        _log.warning(f"Exec error: {e}\nCode:\n{code[:300]}")
         return f"Execution error: {e}"
 
 
@@ -443,7 +446,7 @@ def desktop_control(
             if not actual_task:
                 return "Please describe what you want to do on the desktop."
 
-            print(f"[Desktop] Asking Gemini: {actual_task}")
+            _log.debug(f"Asking Gemini: {actual_task}")
             if player:
                 player.write_log("[Desktop] Generating action...")
 
@@ -457,5 +460,5 @@ def desktop_control(
             return "No action or task specified."
 
     except Exception as e:
-        print(f"[Desktop] Error: {e}")
+        _log.warning(f"Error: {e}")
         return f"Desktop control error: {e}"

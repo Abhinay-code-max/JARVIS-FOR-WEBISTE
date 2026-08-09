@@ -31,6 +31,9 @@ import platform
 
 from config import load_config as _load_config, set_config_key
 from core.llm_client import call_llm_vision as _llm_vision
+import logging
+
+_log = logging.getLogger("jarvis.vision")
 
 _IMG_MAX_W = 640
 _IMG_MAX_H = 360
@@ -41,7 +44,7 @@ def _save_config_key(key: str, value) -> None:
     try:
         set_config_key(key, value)
     except Exception as e:
-        print(f"[Vision] ⚠️ Could not save config key '{key}': {e}")
+        _log.warning(f"⚠️ Could not save config key '{key}': {e}")
 
 
 def _get_os() -> str:
@@ -65,7 +68,7 @@ def _compress(img_bytes: bytes, source_format: str = "PNG") -> tuple[bytes, str]
         img.save(buf, format="JPEG", quality=_JPEG_Q, optimize=False)
         return buf.getvalue(), "image/jpeg"
     except Exception as e:
-        print(f"[Vision] ⚠️ Image compress failed: {e}")
+        _log.warning(f"⚠️ Image compress failed: {e}")
         return img_bytes, f"image/{source_format.lower()}"
 
 
@@ -109,14 +112,14 @@ def _probe_camera(index: int, backend: int, warmup: int = 5) -> bool:
 
 def _detect_camera_index() -> int:
     backend = _cv2_backend()
-    print("[Vision] 🔍 Auto-detecting camera…")
+    _log.debug("🔍 Auto-detecting camera…")
     for idx in range(6):
         if _probe_camera(idx, backend):
-            print(f"[Vision] ✅ Camera found at index {idx}")
+            _log.debug(f"✅ Camera found at index {idx}")
             _save_config_key("camera_index", idx)
             return idx
-        print(f"[Vision] ⚠️ Camera index {idx}: no usable frame")
-    print("[Vision] ⚠️ No camera found — defaulting to index 0")
+        _log.debug(f"⚠️ Camera index {idx}: no usable frame")
+    _log.debug("⚠️ No camera found — defaulting to index 0")
     _save_config_key("camera_index", 0)
     return 0
 
@@ -210,19 +213,19 @@ def screen_process(
     try:
         if angle == "camera":
             image_bytes, mime = _capture_camera()
-            print(f"[Vision] 📷 Camera: {len(image_bytes):,} bytes")
+            _log.debug(f"📷 Camera: {len(image_bytes):,} bytes")
         else:
             image_bytes, mime = _capture_screen()
-            print(f"[Vision] 🖥️  Screen: {len(image_bytes):,} bytes")
+            _log.debug(f"🖥️  Screen: {len(image_bytes):,} bytes")
     except Exception as e:
         msg = f"Capture error: {e}"
-        print(f"[Vision] ❌ {msg}")
+        _log.error(f"❌ {msg}")
         if player: player.write_log(f"ERR: {msg}")
         return msg
 
     # Analyse
     analysis = _call_vision(image_bytes, mime, user_text)
-    print(f"[Vision] 💬 {analysis[:120]}")
+    _log.debug(f"💬 {analysis[:120]}")
 
     if player:
         player.write_log(f"Jarvis: {analysis}")

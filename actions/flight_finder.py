@@ -5,6 +5,9 @@ import subprocess
 from datetime import datetime, timedelta
 
 from config import is_windows, is_mac, is_linux
+import logging
+
+_log = logging.getLogger("jarvis.flight_finder")
 
 
 _MONTH_MAP: dict[str, int] = {
@@ -56,7 +59,7 @@ def _parse_date(raw: str) -> str:
         if re.match(r"\d{4}-\d{2}-\d{2}", result):
             return result
     except Exception as e:
-        print(f"[FlightFinder] ⚠️ LLM date parse failed: {e}")
+        _log.warning(f"⚠️ LLM date parse failed: {e}")
 
     for month_name, month_num in _MONTH_MAP.items():
         if month_name in lower:
@@ -67,7 +70,7 @@ def _parse_date(raw: str) -> str:
                 return f"{year}-{month_num:02d}-{day:02d}"
 
     # Last resort: today
-    print(f"[FlightFinder] ⚠️ Could not parse date '{raw}' — using today.")
+    _log.debug(f"⚠️ Could not parse date '{raw}' — using today.")
     return today.strftime("%Y-%m-%d")
 
 _CABIN_CODE: dict[str, str] = {
@@ -121,7 +124,7 @@ def _search_flights_browser(
         origin, destination, date, return_date, passengers, cabin
     )
 
-    print(f"[FlightFinder] 🌐 Opening: {url}")
+    _log.debug(f"🌐 Opening: {url}")
     browser_control({"action": "go_to", "url": url})
     time.sleep(5)
 
@@ -155,7 +158,7 @@ def _parse_flights_with_gemini(
         flights = json.loads(text)
         return flights if isinstance(flights, list) else []
     except Exception as e:
-        print(f"[FlightFinder] ⚠️ LLM parse failed: {e}")
+        _log.warning(f"⚠️ LLM parse failed: {e}")
         return []
 
 def _format_spoken(
@@ -255,7 +258,7 @@ def _save_to_desktop(content: str, origin: str, destination: str) -> str:
     filepath = desktop / filename
 
     filepath.write_text(content, encoding="utf-8")
-    print(f"[FlightFinder] 💾 Saved: {filepath}")
+    _log.debug(f"💾 Saved: {filepath}")
 
     try:
         if is_windows():
@@ -265,7 +268,7 @@ def _save_to_desktop(content: str, origin: str, destination: str) -> str:
         else:
             subprocess.Popen(["xdg-open", str(filepath)])
     except Exception as e:
-        print(f"[FlightFinder] ⚠️ Could not open text editor: {e}")
+        _log.warning(f"⚠️ Could not open text editor: {e}")
 
     return str(filepath)
 
@@ -299,8 +302,8 @@ def flight_finder(parameters: dict, player=None, speak=None) -> str:
     if speak:
         speak(f"Searching flights from {origin} to {destination} on {date}, sir.")
 
-    print(
-        f"[FlightFinder] ▶️ {origin} → {destination} | {date}"
+    _log.debug(
+        f"▶️ {origin} → {destination} | {date}"
         f"{' → ' + return_date if return_date else ''}"
         f" | {cabin} | {passengers} pax"
     )
@@ -332,5 +335,5 @@ def flight_finder(parameters: dict, player=None, speak=None) -> str:
         return result
 
     except Exception as e:
-        print(f"[FlightFinder] ❌ {e}")
+        _log.error(f"❌ {e}")
         return f"Flight search failed, sir: {e}"

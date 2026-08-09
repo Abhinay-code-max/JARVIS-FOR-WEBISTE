@@ -18,10 +18,13 @@ Enrollment data:
 """
 
 from __future__ import annotations
+import logging
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
+
+_log = logging.getLogger("jarvis.voice_id")
 
 
 class VoiceIdentifier:
@@ -43,9 +46,9 @@ class VoiceIdentifier:
             name = p.stem
             try:
                 self._embeddings[name] = np.load(str(p))
-                print(f"[VoiceID] Loaded embedding for '{name}'")
+                _log.debug("Loaded embedding for '%s'", name)
             except Exception as e:
-                print(f"[VoiceID] Could not load {p}: {e}")
+                _log.warning("Could not load %s: %s", p, e)
 
     # ── Embedding extraction ──────────────────────────────────────────────────
     def _get_embedding(self, audio: np.ndarray) -> Optional[np.ndarray]:
@@ -60,7 +63,7 @@ class VoiceIdentifier:
         except ImportError:
             pass
         except Exception as e:
-            print(f"[VoiceID] SpeechBrain error: {e}")
+            _log.warning("SpeechBrain error: %s", e)
 
         # Strategy 2: MFCC cosine (lightweight, always available with librosa)
         try:
@@ -68,7 +71,7 @@ class VoiceIdentifier:
         except ImportError:
             pass
         except Exception as e:
-            print(f"[VoiceID] MFCC error: {e}")
+            _log.warning("MFCC error: %s", e)
 
         return None
 
@@ -129,7 +132,7 @@ class VoiceIdentifier:
         """
         emb = self._get_embedding(audio)
         if emb is None:
-            print(f"[VoiceID] Audio too short to register '{name}'.")
+            _log.warning("Audio too short to register '%s'.", name)
             return False
 
         out_path = self._dir / f"{name}.npy"
@@ -142,7 +145,7 @@ class VoiceIdentifier:
 
         np.save(str(out_path), emb)
         self._embeddings[name] = emb
-        print(f"[VoiceID] Registered '{name}'.")
+        _log.info("Registered '%s'.", name)
         return True
 
     # ── Utility ───────────────────────────────────────────────────────────────

@@ -11,6 +11,9 @@ from pathlib import Path
 from config import load_config as _load_config, BASE_DIR
 from core.llm_client import call_llm_vision as _llm_vision
 from memory.memory_manager import load_memory as _load_memory
+import logging
+
+_log = logging.getLogger("jarvis.computer_control")
 
 try:
     import pyautogui
@@ -311,7 +314,7 @@ def _screen_find(description: str) -> tuple[int, int] | None:
             return int(match.group(1)), int(match.group(2))
 
     except Exception as e:
-        print(f"[ComputerControl] ⚠️ screen_find failed: {e}")
+        _log.warning(f"⚠️ screen_find failed: {e}")
 
     return None
 
@@ -372,7 +375,7 @@ def computer_control(
     if player:
         player.write_log(f"[Computer] {action}")
 
-    print(f"[ComputerControl] ▶ {action}  {params}")
+    _log.debug(f"▶ {action}  {params}")
 
     try:
 
@@ -454,7 +457,7 @@ def computer_control(
         if action == "random_data":
             dt     = params.get("type", "name")
             result = _random_data(dt)
-            print(f"[ComputerControl] 🎲 random {dt} → {result}")
+            _log.debug(f"🎲 random {dt} → {result}")
             return result
 
         if action == "user_data":
@@ -463,11 +466,11 @@ def computer_control(
             value   = profile.get(field, "")
             if not value:
                 value = _random_data(field)
-                print(f"[ComputerControl] ⚠️ No '{field}' in memory, using random: {value}")
+                _log.debug(f"⚠️ No '{field}' in memory, using random: {value}")
             return value
 
         return f"Unknown action: '{action}'"
 
     except Exception as e:
-        print(f"[ComputerControl] ❌ {action}: {e}")
+        _log.error(f"❌ {action}: {e}")
         return f"computer_control '{action}' failed: {e}"

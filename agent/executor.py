@@ -9,6 +9,7 @@ import threading
 import subprocess
 import tempfile
 import os
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -16,6 +17,7 @@ from agent.planner       import create_plan, replan
 from agent.error_handler import analyze_error, generate_fix, ErrorDecision
 from core.llm_client     import call_llm_text
 from core.tool_dispatch  import TOOL_DISPATCH
+from core.db             import get_conn
 from config              import BASE_DIR
 
 
@@ -158,6 +160,37 @@ def _inject_context(params: dict, tool: str, step_results: dict, goal: str = "")
 
 
 # ---------------------------------------------------------------------------
+# Task event trace (task_events table — new capability, nothing to migrate)
+# ---------------------------------------------------------------------------
+
+def _log_task_event(
+    task_id:     str | None,
+    step_num,
+    tool:        str | None,
+    description: str,
+    status:      str,
+    detail:      str = "",
+) -> None:
+    """Insert one row into task_events. This executor's own per-task
+    worker thread already tolerates multi-second blocking LLM/network
+    calls, so a synchronous DB write here is safe. No-op if task_id is
+    None (e.g. execute() called without one) — a DB hiccup here must
+    never break the actual agent task, so failures are swallowed."""
+    if not task_id:
+        return
+    try:
+        conn = get_conn()
+        with conn:
+            conn.execute(
+                "INSERT INTO task_events (task_id, step_num, tool, description, status, detail, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (task_id, step_num, tool, description, status, detail[:500], time.time()),
+            )
+    except Exception as e:
+        print(f"[Executor] ⚠️ Could not log task event: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Tool routing
 # ---------------------------------------------------------------------------
 
@@ -212,6 +245,7 @@ class AgentExecutor:
         goal:        str,
         speak:       Callable | None        = None,
         cancel_flag: threading.Event | None = None,
+        task_id:     str | None             = None,
     ) -> str:
         print(f"\n[Executor] 🎯 Goal: {goal}")
 
@@ -243,6 +277,7 @@ class AgentExecutor:
                 params   = _inject_context(params, tool, step_results, goal=goal)
 
                 print(f"\n[Executor] ▶️ Step {step_num}: [{tool}] {desc}")
+                _log_task_event(task_id, step_num, tool, desc, "started")
 
                 attempt = 1
                 step_ok = False
@@ -255,12 +290,14 @@ class AgentExecutor:
                         step_results[step_num] = result
                         completed_steps.append(step)
                         print(f"[Executor] ✅ Step {step_num} done: {str(result)[:100]}")
+                        _log_task_event(task_id, step_num, tool, desc, "done", str(result)[:200])
                         step_ok = True
                         break
 
                     except Exception as e:
                         error_msg = str(e)
                         print(f"[Executor] ❌ Step {step_num} attempt {attempt} failed: {error_msg}")
+                        _log_task_event(task_id, step_num, tool, desc, "failed", f"attempt {attempt}: {error_msg}")
 
                         recovery = analyze_error(step, error_msg, attempt=attempt)
                         decision = recovery["decision"]
@@ -270,18 +307,21 @@ class AgentExecutor:
                             speak(user_msg)
 
                         if decision == ErrorDecision.RETRY:
+                            _log_task_event(task_id, step_num, tool, desc, "retried", f"attempt {attempt} -> {attempt + 1}")
                             attempt += 1
-                            import time; time.sleep(2)
+                            time.sleep(2)
                             continue
 
                         elif decision == ErrorDecision.SKIP:
                             print(f"[Executor] ⏭️ Skipping step {step_num}")
+                            _log_task_event(task_id, step_num, tool, desc, "done", "skipped (non-critical)")
                             completed_steps.append(step)
                             step_ok = True
                             break
 
                         elif decision == ErrorDecision.ABORT:
                             msg = f"Task aborted, sir. {recovery.get('reason', '')}"
+                            _log_task_event(task_id, step_num, tool, desc, "failed", f"aborted: {recovery.get('reason', '')}")
                             if speak: speak(msg)
                             return msg
 
@@ -304,13 +344,22 @@ class AgentExecutor:
                                             f"to confirm (player=None). Autonomous code-fix recovery cannot run in "
                                             f"this context."
                                         )
+                                        _log_task_event(
+                                            task_id, step_num, tool, desc, "failed",
+                                            "recovery fix denied — no live user to confirm (player=None)",
+                                        )
                                     else:
+                                        _log_task_event(
+                                            task_id, step_num, fixed_step.get("tool"), desc, "done",
+                                            f"recovered via fix: {str(res)[:150]}",
+                                        )
                                         step_results[step_num] = res
                                         completed_steps.append(step)
                                         step_ok = True
                                         break
                                 except Exception as fix_err:
                                     print(f"[Executor] ⚠️ Fix failed: {fix_err}")
+                                    _log_task_event(task_id, step_num, tool, desc, "failed", f"fix generation failed: {fix_err}")
 
                             failed_step  = step
                             failed_error = error_msg
@@ -321,6 +370,7 @@ class AgentExecutor:
                     failed_step  = step
                     failed_error = "Max retries exceeded"
                     success      = False
+                    _log_task_event(task_id, step_num, tool, desc, "failed", "max retries exceeded")
 
                 if not success:
                     break
@@ -334,6 +384,11 @@ class AgentExecutor:
                 return msg
 
             if speak: speak("Adjusting my approach, sir.")
+            _log_task_event(
+                task_id, failed_step.get("step") if failed_step else None,
+                failed_step.get("tool") if failed_step else None, goal[:200],
+                "replanned", f"after step failure: {failed_error[:150]}",
+            )
             replan_attempts += 1
             plan = replan(goal, completed_steps, failed_step, failed_error)
 

@@ -5,33 +5,53 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Any
 
+from core.db import get_conn
+
 
 class TaskStatus(Enum):
-    PENDING    = "pending"
-    RUNNING    = "running"
-    COMPLETED  = "completed"
-    FAILED     = "failed"
-    CANCELLED  = "cancelled"
+    PENDING     = "pending"
+    RUNNING     = "running"
+    COMPLETED   = "completed"
+    FAILED      = "failed"
+    CANCELLED   = "cancelled"
+    INTERRUPTED = "interrupted"   # DB-only: orphaned pending/running row found at startup, never resumed
 
 
 class TaskPriority(Enum):
     LOW    = 3
     NORMAL = 2
-    HIGH   = 1   
+    HIGH   = 1
 
 
 @dataclass(order=True)
 class Task:
-    priority:    int                       
+    priority:    int
     created_at:  float = field(compare=False)
     task_id:     str   = field(compare=False)
     goal:        str   = field(compare=False)
     status:      TaskStatus = field(compare=False, default=TaskStatus.PENDING)
     result:      Any        = field(compare=False, default=None)
     error:       str        = field(compare=False, default="")
-    speak:       Any        = field(compare=False, default=None)   
-    on_complete: Any        = field(compare=False, default=None)  
+    speak:       Any        = field(compare=False, default=None)
+    on_complete: Any        = field(compare=False, default=None)
     cancel_flag: threading.Event = field(compare=False, default_factory=threading.Event)
+
+
+def _reconcile_interrupted_tasks() -> None:
+    """Called once at startup (see TaskQueue.start()): AgentExecutor isn't
+    step-checkpointed, so a task still 'pending'/'running' in the DB from
+    a previous process lifetime can't be safely resumed — mark it
+    'interrupted' instead of silently losing it or attempting to continue
+    mid-flight."""
+    conn = get_conn()
+    with conn:
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, updated_at = ? WHERE status IN (?, ?)",
+            (TaskStatus.INTERRUPTED.value, time.time(), TaskStatus.PENDING.value, TaskStatus.RUNNING.value),
+        )
+        n = cur.rowcount
+    if n:
+        print(f"[TaskQueue] ⚠️ Marked {n} orphaned task(s) from a previous run as interrupted.")
 
 
 class TaskQueue:
@@ -39,12 +59,12 @@ class TaskQueue:
         self._queue:        list[Task]       = []
         self._lock:         threading.Lock   = threading.Lock()
         self._condition:    threading.Condition = threading.Condition(self._lock)
-        self._tasks:        dict[str, Task]  = {} 
+        self._tasks:        dict[str, Task]  = {}
         self._running:      bool             = False
         self._worker_thread: threading.Thread | None = None
         self._max_concurrent = max_concurrent
         self._active_count   = 0
-        self._executor       = None  
+        self._executor       = None
 
     def _get_executor(self):
         if self._executor is None:
@@ -52,9 +72,24 @@ class TaskQueue:
             self._executor = AgentExecutor()
         return self._executor
 
+    def _write_task_row(self, task_id: str, **fields) -> None:
+        """Write-through UPDATE to the tasks table — durability only, never
+        read back by get_status()/get_all_statuses() (those stay on the
+        in-memory dict, see below). `fields` keys are always internal
+        column names we control, never user input."""
+        if not fields:
+            return
+        fields["updated_at"] = time.time()
+        set_clause = ", ".join(f"{col} = ?" for col in fields)
+        values     = list(fields.values()) + [task_id]
+        conn = get_conn()
+        with conn:
+            conn.execute(f"UPDATE tasks SET {set_clause} WHERE task_id = ?", values)
+
     def start(self) -> None:
         if self._running:
             return
+        _reconcile_interrupted_tasks()
         self._running      = True
         self._worker_thread = threading.Thread(
             target=self._worker_loop,
@@ -94,6 +129,14 @@ class TaskQueue:
             self._tasks[task_id] = task
             self._condition.notify()
 
+        conn = get_conn()
+        with conn:
+            conn.execute(
+                "INSERT INTO tasks (task_id, goal, priority, status, result, error, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (task_id, goal, task.priority, task.status.value, None, "", task.created_at, task.created_at),
+            )
+
         print(f"[TaskQueue] 📥 Task queued: [{task_id}] {goal[:60]}")
         return task_id
 
@@ -109,9 +152,14 @@ class TaskQueue:
             task.cancel_flag.set()
             task.status = TaskStatus.CANCELLED
             print(f"[TaskQueue] 🚫 Task cancelled: [{task_id}]")
-            return True
+
+        self._write_task_row(task_id, status=TaskStatus.CANCELLED.value)
+        return True
 
     def get_status(self, task_id: str) -> dict | None:
+        """Reads the in-memory dict only — the DB is written-through for
+        durability/history, not read-through here (unchanged from before
+        the persistence layer landed)."""
         with self._lock:
             task = self._tasks.get(task_id)
             if not task:
@@ -125,6 +173,7 @@ class TaskQueue:
             }
 
     def get_all_statuses(self) -> list[dict]:
+        """Same in-memory-only read path as get_status() — see there."""
         with self._lock:
             return [
                 {
@@ -156,6 +205,7 @@ class TaskQueue:
                         pass
 
             if task:
+                self._write_task_row(task.task_id, status=TaskStatus.RUNNING.value)
                 threading.Thread(
                     target=self._run_task,
                     args=(task,),
@@ -179,6 +229,7 @@ class TaskQueue:
                 goal        = task.goal,
                 speak       = task.speak,
                 cancel_flag = task.cancel_flag,
+                task_id     = task.task_id,
             )
 
             with self._lock:
@@ -188,6 +239,12 @@ class TaskQueue:
                     task.status = TaskStatus.COMPLETED
                     task.result = result
                 self._active_count -= 1
+
+            self._write_task_row(
+                task.task_id,
+                status = task.status.value,
+                result = task.result if isinstance(task.result, str) else str(task.result) if task.result is not None else None,
+            )
 
             if task.on_complete and not task.cancel_flag.is_set():
                 try:
@@ -202,6 +259,7 @@ class TaskQueue:
                 task.status = TaskStatus.FAILED
                 task.error  = str(e)
                 self._active_count -= 1
+            self._write_task_row(task.task_id, status=TaskStatus.FAILED.value, error=task.error)
             print(f"[TaskQueue] ❌ Failed: [{task.task_id}] {e}")
 
         with self._condition:

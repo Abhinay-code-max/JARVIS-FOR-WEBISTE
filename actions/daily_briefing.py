@@ -5,19 +5,7 @@ from pathlib import Path
 import requests
 
 from config import load_config as _load_config, BASE_DIR
-
-
-def _load_memory() -> dict:
-    """Load memory — tries both possible filenames for compatibility."""
-    mem_dir = BASE_DIR / "memory"
-    for fname in ("long_term.json", "long_term_memory.json"):
-        p = mem_dir / fname
-        if p.exists():
-            try:
-                return json.loads(p.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-    return {}
+from memory.memory_manager import load_memory as _load_memory
 
 
 def _extract_value(entry, _depth: int = 0) -> str:

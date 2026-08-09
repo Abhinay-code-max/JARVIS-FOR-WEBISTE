@@ -3,5 +3,8 @@ __pycache__/
 config/api_keys.json
 config/contacts.json
 memory/long_term.json
+data/jarvis.db
+data/jarvis.db-wal
+data/jarvis.db-shm
 recognition/faces/*.npy
 recognition/voices/*.npy

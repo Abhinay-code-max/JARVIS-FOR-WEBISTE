@@ -1,6 +1,5 @@
 #computer_control.py
 import io
-import json
 import re
 import string
 import subprocess
@@ -11,6 +10,7 @@ from pathlib import Path
 
 from config import load_config as _load_config, BASE_DIR
 from core.llm_client import call_llm_vision as _llm_vision
+from memory.memory_manager import load_memory as _load_memory
 
 try:
     import pyautogui
@@ -25,8 +25,6 @@ try:
     _PYPERCLIP = True
 except ImportError:
     _PYPERCLIP = False
-
-_MEMORY_PATH  = BASE_DIR / "memory" / "long_term.json"
 
 def _get_os() -> str:
     import platform
@@ -125,10 +123,9 @@ def _random_data(data_type: str) -> str:
 def _user_profile() -> dict:
     """Read identity fields from long-term memory."""
     try:
-        if _MEMORY_PATH.exists():
-            data     = json.loads(_MEMORY_PATH.read_text(encoding="utf-8"))
-            identity = data.get("identity", {})
-            return {k: v.get("value", "") for k, v in identity.items()}
+        data     = _load_memory()
+        identity = data.get("identity", {})
+        return {k: v.get("value", "") for k, v in identity.items()}
     except Exception:
         pass
     return {}

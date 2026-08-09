@@ -1,11 +1,13 @@
-import json
 from datetime import datetime
-from threading import Lock
 
 from config import BASE_DIR
+from core.db import get_conn
 
-MEMORY_PATH      = BASE_DIR / "memory" / "long_term.json"
-_lock            = Lock()
+# Legacy JSON location — no longer read/written directly (see
+# core.db._migrate_legacy_memory), but memory_manager.py still owns this
+# path constant since the migration script imports it from here.
+MEMORY_PATH = BASE_DIR / "memory" / "long_term.json"
+
 # Entries are capped at MAX_VALUE_LENGTH (380) chars each, so 2200 total
 # left room for only ~6 entries before silently evicting the oldest ones.
 # 8000 gives realistic day-to-day headroom (~20+ entries) while still
@@ -13,32 +15,40 @@ _lock            = Lock()
 MAX_VALUE_LENGTH = 380
 MEMORY_MAX_CHARS = 8000
 
+# Every row in this phase uses the 'default' store — see memory_entries'
+# schema comment in core/db.py for why the column exists anyway.
+_STORE = "default"
+
+_CATEGORIES = ("identity", "preferences", "projects", "relationships", "wishes", "notes")
+
+
 def _empty_memory() -> dict:
-    return {
-        "identity":      {},
-        "preferences":   {},
-        "projects":      {},
-        "relationships": {},
-        "wishes":        {},
-        "notes":         {},
-    }
+    return {cat: {} for cat in _CATEGORIES}
+
+
+def _rows_to_memory(rows) -> dict:
+    """Reshape memory_entries rows into the exact nested dict shape every
+    existing caller already expects: {category: {key: {"value":.., "updated":..}}}."""
+    memory = _empty_memory()
+    for row in rows:
+        cat = row["category"]
+        if cat not in memory:
+            memory[cat] = {}   # tolerate a category outside the current 6 rather than drop data
+        memory[cat][row["key"]] = {"value": row["value"], "updated": row["updated_at"]}
+    return memory
+
+
+def _load_memory_on(conn) -> dict:
+    rows = conn.execute(
+        "SELECT category, key, value, updated_at FROM memory_entries WHERE store = ?",
+        (_STORE,),
+    ).fetchall()
+    return _rows_to_memory(rows)
+
 
 def load_memory() -> dict:
-    if not MEMORY_PATH.exists():
-        return _empty_memory()
-    with _lock:
-        try:
-            data = json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                base = _empty_memory()
-                for key in base:
-                    if key not in data:
-                        data[key] = {}
-                return data
-            return _empty_memory()
-        except Exception as e:
-            print(f"[Memory] ⚠️ Load error: {e}")
-            return _empty_memory()
+    return _load_memory_on(get_conn())
+
 
 def _all_entries(memory: dict) -> list[tuple]:
     entries = []
@@ -51,30 +61,62 @@ def _all_entries(memory: dict) -> list[tuple]:
     return entries
 
 
-def _trim_to_limit(memory: dict) -> tuple[dict, list[tuple[str, str]]]:
-    if len(json.dumps(memory, ensure_ascii=False)) <= MEMORY_MAX_CHARS:
-        return memory, []
-    entries = _all_entries(memory)
-    entries.sort(key=lambda t: t[2].get("updated", "0000-00-00"))
+def _upsert_entries(conn, memory: dict) -> None:
+    for cat, key, entry in _all_entries(memory):
+        value   = entry.get("value", "")
+        updated = entry.get("updated") or datetime.now().strftime("%Y-%m-%d")
+        conn.execute(
+            "INSERT INTO memory_entries (store, category, key, value, updated_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(store, category, key) DO UPDATE SET "
+            "value = excluded.value, updated_at = excluded.updated_at",
+            (_STORE, cat, key, value, updated),
+        )
+
+
+def _evict_over_budget(conn) -> list[tuple[str, str]]:
+    """Delete oldest-updated_at rows until SUM(LENGTH(value)) across all
+    'default'-store rows is back under MEMORY_MAX_CHARS. Must be called
+    from within the caller's own transaction (it does not commit)."""
+    total = conn.execute(
+        "SELECT COALESCE(SUM(LENGTH(value)), 0) FROM memory_entries WHERE store = ?",
+        (_STORE,),
+    ).fetchone()[0]
+    if total <= MEMORY_MAX_CHARS:
+        return []
+
+    rows = conn.execute(
+        "SELECT category, key, LENGTH(value) AS vlen FROM memory_entries "
+        "WHERE store = ? ORDER BY updated_at ASC",
+        (_STORE,),
+    ).fetchall()
+
     evicted = []
-    for cat, key, _ in entries:
-        if len(json.dumps(memory, ensure_ascii=False)) <= MEMORY_MAX_CHARS:
+    for row in rows:
+        if total <= MEMORY_MAX_CHARS:
             break
-        del memory[cat][key]
-        evicted.append((cat, key))
-        print(f"[Memory] 🗑️  Trimmed {cat}/{key}")
-    return memory, evicted
+        conn.execute(
+            "DELETE FROM memory_entries WHERE store = ? AND category = ? AND key = ?",
+            (_STORE, row["category"], row["key"]),
+        )
+        total -= row["vlen"]
+        evicted.append((row["category"], row["key"]))
+        print(f"[Memory] 🗑️  Trimmed {row['category']}/{row['key']}")
+    return evicted
+
 
 def save_memory(memory: dict) -> list[tuple[str, str]]:
     if not isinstance(memory, dict):
         return []
-    memory, evicted = _trim_to_limit(memory)
-    MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with _lock:
-        MEMORY_PATH.write_text(
-            json.dumps(memory, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+    conn = get_conn()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        _upsert_entries(conn, memory)
+        evicted = _evict_over_budget(conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     return evicted
 
 
@@ -108,17 +150,33 @@ def _recursive_update(target: dict, updates: dict) -> bool:
 
 
 def update_memory(memory_update: dict) -> dict:
+    """Single-transaction read-modify-write: BEGIN IMMEDIATE takes the
+    write lock before the read happens, so a second concurrent
+    update_memory()/forget() call blocks (up to busy_timeout) until this
+    one commits, instead of both loading the same stale base and one
+    silently clobbering the other's write — the race the old file-based
+    load-then-separately-save flow had."""
     if not isinstance(memory_update, dict) or not memory_update:
         return load_memory()
-    memory = load_memory()
-    if _recursive_update(memory, memory_update):
-        evicted = save_memory(memory)
-        msg = f"[Memory] 💾 Saved: {list(memory_update.keys())}"
-        if evicted:
-            forgotten = ", ".join(f"{cat}/{key}" for cat, key in evicted)
-            msg += f" | Memory limit reached — forgot: {forgotten}"
-        print(msg)
+
+    conn = get_conn()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        memory = _load_memory_on(conn)
+        if _recursive_update(memory, memory_update):
+            _upsert_entries(conn, memory)
+            evicted = _evict_over_budget(conn)
+            msg = f"[Memory] 💾 Saved: {list(memory_update.keys())}"
+            if evicted:
+                forgotten = ", ".join(f"{cat}/{key}" for cat, key in evicted)
+                msg += f" | Memory limit reached — forgot: {forgotten}"
+            print(msg)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     return memory
+
 
 def format_memory_for_prompt(memory: dict | None) -> str:
     if not memory:
@@ -196,6 +254,7 @@ def format_memory_for_prompt(memory: dict | None) -> str:
 
     return result + "\n"
 
+
 def remember(key: str, value: str, category: str = "notes") -> str:
     valid = {"identity", "preferences", "projects", "relationships", "wishes", "notes"}
     if category not in valid:
@@ -205,17 +264,31 @@ def remember(key: str, value: str, category: str = "notes") -> str:
 
 
 def forget(key: str, category: str = "notes") -> str:
-    memory = load_memory()
-    cat    = memory.get(category, {})
-    if key in cat:
-        del cat[key]
-        memory[category] = cat
-        evicted = save_memory(memory)
-        if evicted:
-            forgotten = ", ".join(f"{c}/{k}" for c, k in evicted)
-            print(f"[Memory] 💾 Saved after forget | Memory limit reached — forgot: {forgotten}")
-        return f"Forgotten: {category}/{key}"
-    return f"Not found: {category}/{key}"
+    conn = get_conn()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM memory_entries WHERE store = ? AND category = ? AND key = ?",
+            (_STORE, category, key),
+        ).fetchone()
+        if not row:
+            conn.rollback()
+            return f"Not found: {category}/{key}"
+
+        conn.execute(
+            "DELETE FROM memory_entries WHERE store = ? AND category = ? AND key = ?",
+            (_STORE, category, key),
+        )
+        evicted = _evict_over_budget(conn)   # deletion alone can't overflow; kept for parity with the original save_memory-after-forget behavior
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    if evicted:
+        forgotten = ", ".join(f"{c}/{k}" for c, k in evicted)
+        print(f"[Memory] 💾 Saved after forget | Memory limit reached — forgot: {forgotten}")
+    return f"Forgotten: {category}/{key}"
 
 
 forget_memory = forget

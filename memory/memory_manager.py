@@ -6,8 +6,12 @@ from config import BASE_DIR
 
 MEMORY_PATH      = BASE_DIR / "memory" / "long_term.json"
 _lock            = Lock()
+# Entries are capped at MAX_VALUE_LENGTH (380) chars each, so 2200 total
+# left room for only ~6 entries before silently evicting the oldest ones.
+# 8000 gives realistic day-to-day headroom (~20+ entries) while still
+# keeping the blob small enough to stay cheap in the prompt context.
 MAX_VALUE_LENGTH = 380
-MEMORY_MAX_CHARS = 2200
+MEMORY_MAX_CHARS = 8000
 
 def _empty_memory() -> dict:
     return {
@@ -47,28 +51,31 @@ def _all_entries(memory: dict) -> list[tuple]:
     return entries
 
 
-def _trim_to_limit(memory: dict) -> dict:
+def _trim_to_limit(memory: dict) -> tuple[dict, list[tuple[str, str]]]:
     if len(json.dumps(memory, ensure_ascii=False)) <= MEMORY_MAX_CHARS:
-        return memory
+        return memory, []
     entries = _all_entries(memory)
     entries.sort(key=lambda t: t[2].get("updated", "0000-00-00"))
+    evicted = []
     for cat, key, _ in entries:
         if len(json.dumps(memory, ensure_ascii=False)) <= MEMORY_MAX_CHARS:
             break
         del memory[cat][key]
+        evicted.append((cat, key))
         print(f"[Memory] 🗑️  Trimmed {cat}/{key}")
-    return memory
+    return memory, evicted
 
-def save_memory(memory: dict) -> None:
+def save_memory(memory: dict) -> list[tuple[str, str]]:
     if not isinstance(memory, dict):
-        return
-    memory = _trim_to_limit(memory)
+        return []
+    memory, evicted = _trim_to_limit(memory)
     MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
     with _lock:
         MEMORY_PATH.write_text(
             json.dumps(memory, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+    return evicted
 
 
 def _truncate_value(val: str) -> str:
@@ -105,8 +112,12 @@ def update_memory(memory_update: dict) -> dict:
         return load_memory()
     memory = load_memory()
     if _recursive_update(memory, memory_update):
-        save_memory(memory)
-        print(f"[Memory] 💾 Saved: {list(memory_update.keys())}")
+        evicted = save_memory(memory)
+        msg = f"[Memory] 💾 Saved: {list(memory_update.keys())}"
+        if evicted:
+            forgotten = ", ".join(f"{cat}/{key}" for cat, key in evicted)
+            msg += f" | Memory limit reached — forgot: {forgotten}"
+        print(msg)
     return memory
 
 def format_memory_for_prompt(memory: dict | None) -> str:
@@ -199,7 +210,10 @@ def forget(key: str, category: str = "notes") -> str:
     if key in cat:
         del cat[key]
         memory[category] = cat
-        save_memory(memory)
+        evicted = save_memory(memory)
+        if evicted:
+            forgotten = ", ".join(f"{c}/{k}" for c, k in evicted)
+            print(f"[Memory] 💾 Saved after forget | Memory limit reached — forgot: {forgotten}")
         return f"Forgotten: {category}/{key}"
     return f"Not found: {category}/{key}"
 

@@ -6,7 +6,15 @@ import json
 import re
 
 from core.llm_client import call_llm_text
+from core.tool_dispatch import TOOL_DISPATCH
 from config import BASE_DIR
+
+# Tool names _call_tool() actually knows how to run. Any step whose "tool"
+# isn't in this set (or the literal "generated_code", handled separately
+# below) would otherwise reach executor.py's unknown-tool path — catching
+# it here means a hallucinated/misspelled tool name never leaves the
+# planner in the first place.
+_VALID_TOOLS = set(TOOL_DISPATCH.keys())
 
 
 PLANNER_PROMPT = """You are the planning module of MARK XL, a personal AI assistant.
@@ -136,8 +144,13 @@ def create_plan(goal: str, context: str = "") -> dict:
             raise ValueError("Invalid plan structure")
 
         for step in plan["steps"]:
-            if step.get("tool") == "generated_code":
+            tool = step.get("tool")
+            if tool == "generated_code":
                 print(f"[Planner] ⚠️ generated_code in step {step.get('step')} — replacing with web_search")
+                step["tool"]       = "web_search"
+                step["parameters"] = {"query": step.get("description", goal)[:200]}
+            elif tool not in _VALID_TOOLS:
+                print(f"[Planner] ⚠️ Unknown tool '{tool}' in step {step.get('step')} — replacing with web_search")
                 step["tool"]       = "web_search"
                 step["parameters"] = {"query": step.get("description", goal)[:200]}
 
@@ -190,7 +203,12 @@ Create a REVISED plan for the remaining work only. Do not repeat completed steps
         plan = json.loads(text)
 
         for step in plan.get("steps", []):
-            if step.get("tool") == "generated_code":
+            tool = step.get("tool")
+            if tool == "generated_code":
+                step["tool"]       = "web_search"
+                step["parameters"] = {"query": step.get("description", goal)[:200]}
+            elif tool not in _VALID_TOOLS:
+                print(f"[Planner] ⚠️ Unknown tool '{tool}' in step {step.get('step')} — replacing with web_search")
                 step["tool"]       = "web_search"
                 step["parameters"] = {"query": step.get("description", goal)[:200]}
 

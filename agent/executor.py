@@ -176,8 +176,10 @@ def _call_tool(tool: str, parameters: dict, speak: Callable | None) -> str:
         return TOOL_DISPATCH[tool](parameters, None, speak)
 
     else:
-        print(f"[Executor] ⚠️ Unknown tool '{tool}' — falling back to generated_code")
-        return _run_generated_code(f"Accomplish this task: {parameters}", speak=speak)
+        raise ValueError(
+            f"Unknown tool '{tool}' — no such tool exists. "
+            f"Available tools: {sorted(TOOL_DISPATCH.keys())}"
+        )
 
 
 # ---------------------------------------------------------------------------

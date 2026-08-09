@@ -444,6 +444,29 @@ TOOL_DECLARATIONS = [
         "description": "Shuts down JARVIS when the user says goodbye or stop.",
         "parameters": {"type": "OBJECT", "properties": {}}
     },
+    {
+        "name": "daily_briefing",
+        "description": (
+            "Give the user a spoken morning/afternoon/evening briefing: "
+            "greeting, today's date, current weather in their city, "
+            "today's pending reminders, and top news headlines. Use when "
+            "the user asks for a briefing, summary of their day, or says "
+            "something like 'what's my day look like' or 'give me a briefing'."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "city": {
+                    "type": "STRING",
+                    "description": (
+                        "Optional. City for the weather portion. If omitted, "
+                        "pulled automatically from saved memory."
+                    )
+                }
+            },
+            "required": []
+        }
+    },
 ]
 
 

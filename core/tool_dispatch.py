@@ -107,6 +107,11 @@ def _flight_finder(parameters, player, speak):
     return flight_finder(parameters=parameters, player=player) or "Done."
 
 
+def _daily_briefing(parameters, player, speak):
+    from actions.daily_briefing import daily_briefing
+    return daily_briefing(parameters=parameters, player=player, speak=speak)
+
+
 TOOL_DISPATCH: dict[str, Callable[[dict, object, Optional[Callable]], str]] = {
     "open_app":          _open_app,
     "weather_report":    _weather_report,
@@ -125,4 +130,5 @@ TOOL_DISPATCH: dict[str, Callable[[dict, object, Optional[Callable]], str]] = {
     "computer_control":  _computer_control,
     "game_updater":      _game_updater,
     "flight_finder":     _flight_finder,
+    "daily_briefing":    _daily_briefing,
 }

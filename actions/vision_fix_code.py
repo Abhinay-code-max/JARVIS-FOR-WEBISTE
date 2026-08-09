@@ -117,11 +117,18 @@ def _get_search_roots() -> list[str]:
     return unique_roots
 
 
-def _find_file_on_disk(hint_filename: str, search_roots: list[str]) -> Optional[Path]:
+def _find_file_on_disk(hint_filename: str, search_roots: list[str]) -> list[Path]:
     if not hint_filename:
-        return None
+        return []
 
     hint_filename = hint_filename.strip()
+    matches: list[Path] = []
+    seen = set()
+
+    def _add(p: Path):
+        if p not in seen:
+            seen.add(p)
+            matches.append(p)
 
     for root in search_roots:
         root_path = Path(root)
@@ -129,16 +136,16 @@ def _find_file_on_disk(hint_filename: str, search_roots: list[str]) -> Optional[
             continue
         candidate = root_path / hint_filename
         if candidate.exists():
-            return candidate
+            _add(candidate)
         try:
             for p in root_path.rglob(hint_filename):
                 if any(skip in str(p) for skip in ("node_modules", ".git", "__pycache__", "venv", ".backup")):
                     continue
-                return p
+                _add(p)
         except Exception:
             continue
 
-    return None
+    return matches
 
 
 def _extract_filename_from_title(title: str) -> str:
@@ -250,20 +257,39 @@ def vision_fix_code(parameters: dict = None, player=None, speak=None) -> str:
 
     search_roots = _get_search_roots()
     _log(f"Searching for '{filename}' across {len(search_roots)} locations (including OneDrive)...")
-    fpath = _find_file_on_disk(filename, search_roots)
+    matches = _find_file_on_disk(filename, search_roots)
 
-    if not fpath:
+    if not matches:
         return (
             f"I identified the bug in {filename} ({bug_desc}), but couldn't locate "
             f"the file on disk to fix it automatically. Could you tell me its full path?"
         )
 
+    if len(matches) > 1:
+        shown = [str(p) for p in matches[:5]]
+        listing = ", ".join(shown)
+        if len(matches) > 5:
+            listing += f", +{len(matches) - 5} more"
+        return (
+            f"I found {filename} in multiple places: {listing} — which one did you "
+            f"mean? Tell me the full path."
+        )
+
+    fpath = matches[0]
     _log(f"Found file: {fpath}")
 
     try:
         file_content = fpath.read_text(encoding="utf-8")
     except Exception as e:
         return f"Found {fpath.name} but couldn't read it: {e}"
+
+    from core.confirm import CONFIRM
+    confirm_prompt = (
+        f"I found the bug in {fpath.name}: {bug_desc}. I'll overwrite it with a "
+        f"fix (a backup will be saved as {fpath.name}.backup)."
+    )
+    if not CONFIRM.request(player, confirm_prompt, speak=speak):
+        return "Cancelled — did not modify the file."
 
     _log("Generating fix...")
     fixed_code = _call_llm_to_fix(file_content, bug_desc, config)

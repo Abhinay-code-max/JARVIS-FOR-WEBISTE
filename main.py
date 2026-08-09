@@ -467,6 +467,22 @@ TOOL_DECLARATIONS = [
             "required": []
         }
     },
+    {
+        "name": "vision_fix_code",
+        "description": (
+            "Look at the user's screen, identify a bug in the visible code, "
+            "and fix it directly on disk after confirming with the user. "
+            "Use ONLY when the user explicitly asks to look at/fix code on "
+            "their screen — e.g. 'look at my screen and fix this bug', "
+            "'what's wrong with this code'. Requires the file to be visibly "
+            "open in an editor."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {},
+            "required": []
+        }
+    },
 ]
 
 

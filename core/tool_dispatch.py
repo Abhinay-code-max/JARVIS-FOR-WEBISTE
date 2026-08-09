@@ -112,6 +112,11 @@ def _daily_briefing(parameters, player, speak):
     return daily_briefing(parameters=parameters, player=player, speak=speak)
 
 
+def _vision_fix_code(parameters, player, speak):
+    from actions.vision_fix_code import vision_fix_code
+    return vision_fix_code(parameters=parameters, player=player, speak=speak)
+
+
 TOOL_DISPATCH: dict[str, Callable[[dict, object, Optional[Callable]], str]] = {
     "open_app":          _open_app,
     "weather_report":    _weather_report,
@@ -131,4 +136,5 @@ TOOL_DISPATCH: dict[str, Callable[[dict, object, Optional[Callable]], str]] = {
     "game_updater":      _game_updater,
     "flight_finder":     _flight_finder,
     "daily_briefing":    _daily_briefing,
+    "vision_fix_code":   _vision_fix_code,
 }

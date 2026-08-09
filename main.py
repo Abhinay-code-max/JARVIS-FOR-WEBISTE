@@ -641,6 +641,7 @@ class JarvisXL:
 
     MAX_HISTORY     = 20   # turns (up from 10 in MARK XL)
     MAX_TOOL_ROUNDS = 6
+    WAKE_WINDOW_SEC = 15.0  # how long JARVIS stays "awake" after the wake word / last command, before requiring it again
 
     def __init__(self, ui: JarvisUI):
         self.ui                = ui
@@ -669,7 +670,11 @@ class JarvisXL:
         # Recognition subsystems
         self._face_id:  FaceIdentifier  = FaceIdentifier(FACES_DIR)
         self._voice_id: VoiceIdentifier = VoiceIdentifier(VOICES_DIR)
-        self._wake:     WakeWordDetector = WakeWordDetector()
+        self._wake:       WakeWordDetector = WakeWordDetector(on_wake=self._on_wake_detected)
+        # epoch time until which the wake-word gate is open; 0.0 = asleep,
+        # requires the wake word before the next mic-derived command is
+        # accepted (see _wake_gate). Typed text bypasses this entirely.
+        self._wake_until: float = 0.0
 
         # Current-session user state
         self._current_user:   str | None = None   # name once identified
@@ -814,6 +819,42 @@ class JarvisXL:
 
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
+
+    # ── Wake word ──────────────────────────────────────────────────────────────
+    def _on_wake_detected(self) -> None:
+        """Callback for WakeWordDetector's streaming/openwakeword mode
+        (env var USE_OPENWAKEWORD=1) — opens the awake window. Note:
+        streaming mode also requires raw audio chunks to be fed to
+        self._wake.process_audio_chunk(), which nothing in this codebase
+        currently does (that would mean a second concurrent mic stream
+        alongside whichever STT engine is active). This callback is wired
+        for when that's added later; it's inert until then."""
+        self._wake_until = time.time() + self.WAKE_WINDOW_SEC
+        print("[WakeWord] Wake word detected (streaming mode).")
+
+    def _wake_gate(self, text: str) -> str | None:
+        """Wake-word gate for mic-derived transcriptions (default
+        'transcription' mode — check() is run against text STT already
+        produced, no extra mic stream involved). While within an open
+        awake window, utterances pass straight through and slide the
+        window forward, so an ongoing back-and-forth doesn't need the
+        wake word every turn. Otherwise only an utterance containing the
+        wake phrase is let through, with the phrase stripped, which also
+        opens a new window. Set 'wake_word_enabled': false in config to
+        disable and restore the old always-on behaviour.
+        Returns the (possibly stripped) text to enqueue, or None to drop
+        the utterance silently."""
+        if not self._config.get("wake_word_enabled", True):
+            return text
+        now = time.time()
+        if now < self._wake_until:
+            self._wake_until = now + self.WAKE_WINDOW_SEC
+            return text
+        if not self._wake.check(text):
+            return None
+        self._wake_until = now + self.WAKE_WINDOW_SEC
+        stripped = self._wake.strip_wake_word(text)
+        return stripped if stripped.strip() else None
 
     # ── Text command entry ────────────────────────────────────────────────────
     def _enqueue_command(self, text: str) -> None:
@@ -1108,7 +1149,9 @@ class JarvisXL:
             self._last_voice_buf = utterance   # store for voice-ID
             t = self._stt.transcribe(utterance)
             if t and t.strip():
-                self._enqueue_command(t.strip())
+                gated = self._wake_gate(t.strip())
+                if gated:
+                    self._enqueue_command(gated)
 
         def _cb(indata, frames, time_info, status):
             if self.ui.muted:
@@ -1177,7 +1220,9 @@ class JarvisXL:
         def _on_transcript(text: str) -> None:
             if self.ui.muted or self._echo_gated(): return
             if text and text.strip():
-                self._enqueue_command(text.strip())
+                gated = self._wake_gate(text.strip())
+                if gated:
+                    self._enqueue_command(gated)
 
         def _is_speaking() -> bool:
             with self._speaking_lock:

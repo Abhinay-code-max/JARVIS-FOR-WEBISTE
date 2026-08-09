@@ -675,6 +675,14 @@ class JarvisXL:
         # requires the wake word before the next mic-derived command is
         # accepted (see _wake_gate). Typed text bypasses this entirely.
         self._wake_until: float = 0.0
+        # Set by _handle_barge_in(); consumed (one-shot) by the next
+        # _wake_gate() call so an interrupt-driven utterance always bypasses
+        # the wake-word check. Deliberately separate from
+        # _interrupted_by_barge_in below — that flag is consumed almost
+        # immediately by _tts_worker's finally block, often well before the
+        # interrupted utterance finishes transcribing and reaches
+        # _wake_gate, so it can't double as this signal.
+        self._barge_in_pending: bool = False
 
         # Current-session user state
         self._current_user:   str | None = None   # name once identified
@@ -816,6 +824,7 @@ class JarvisXL:
             self._speaking                 = False
             self._speech_end_time          = 0.0   # don't leave the tail grace window active
             self._interrupted_by_barge_in  = True
+            self._barge_in_pending         = True   # consumed by the next _wake_gate() call — see __init__
 
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
@@ -845,6 +854,14 @@ class JarvisXL:
         Returns the (possibly stripped) text to enqueue, or None to drop
         the utterance silently."""
         if not self._config.get("wake_word_enabled", True):
+            return text
+        if self._barge_in_pending:
+            # The user interrupted JARVIS's own speech — that's already
+            # unambiguous proof of intent to engage, so this utterance
+            # bypasses the wake-word check outright (but still opens/
+            # refreshes the awake window like a normal wake-word hit would).
+            self._barge_in_pending = False
+            self._wake_until = time.time() + self.WAKE_WINDOW_SEC
             return text
         now = time.time()
         if now < self._wake_until:

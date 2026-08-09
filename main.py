@@ -1074,10 +1074,16 @@ class JarvisXL:
             + "\n".join(f"{m['role'].upper()}: {m.get('content','')}" for m in old)
         )
         try:
-            summary_text = call_llm(
-                [{"role": "user", "content": summary_prompt}],
-                tools=[], system="You are a concise summariser."
+            summary_response = call_llm(
+                [
+                    {"role": "system", "content": "You are a concise summariser."},
+                    {"role": "user", "content": summary_prompt},
+                ],
+                tools=[],
             )
+            summary_text = summary_response.get("content", "").strip()
+            if not summary_text:
+                summary_text = "(earlier context omitted)"
         except Exception:
             summary_text = "(earlier context omitted)"
         summary_msg = {

@@ -19,7 +19,7 @@ requests
 # ── Web automation & search ───────────────────────────────────────────────
 playwright
 beautifulsoup4
-duckduckgo-search
+ddgs
 
 # ── OS control (cross-platform) ───────────────────────────────────────────
 pyautogui

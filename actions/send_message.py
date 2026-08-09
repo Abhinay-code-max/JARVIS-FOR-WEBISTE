@@ -3,7 +3,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from config import load_config, BASE_DIR
+from config import BASE_DIR, get_os
 
 try:
     import pyautogui
@@ -18,13 +18,6 @@ try:
     _PYPERCLIP = True
 except ImportError:
     _PYPERCLIP = False
-
-
-def _get_os() -> str:
-    try:
-        return load_config().get("os_system", "windows").lower()
-    except Exception:
-        return "windows"
 
 
 def _load_contacts() -> dict:
@@ -91,7 +84,7 @@ def _require_pyautogui():
 
 def _paste_text(text: str) -> None:
     _require_pyautogui()
-    os_name = _get_os()
+    os_name = get_os()
     paste_hotkey = ("command", "v") if os_name == "mac" else ("ctrl", "v")
     if _PYPERCLIP:
         pyperclip.copy(text)
@@ -104,7 +97,7 @@ def _paste_text(text: str) -> None:
 
 def _clear_and_paste(text: str) -> None:
     _require_pyautogui()
-    os_name = _get_os()
+    os_name = get_os()
     select_all = ("command", "a") if os_name == "mac" else ("ctrl", "a")
     pyautogui.hotkey(*select_all)
     time.sleep(0.1)
@@ -135,7 +128,7 @@ def _send_whatsapp(receiver: str, message: str) -> str:
     exact_name = _resolve_contact(receiver)
     print(f"[SendMessage] WhatsApp → resolved '{receiver}' to '{exact_name}'")
 
-    os_name = _get_os()
+    os_name = get_os()
 
     # Open WhatsApp
     if os_name == "windows":
@@ -175,7 +168,7 @@ def _send_whatsapp(receiver: str, message: str) -> str:
 
 def _open_app(app_name: str) -> bool:
     _require_pyautogui()
-    os_name = _get_os()
+    os_name = get_os()
     try:
         if os_name == "windows":
             pyautogui.press("win")

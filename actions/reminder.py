@@ -6,14 +6,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from config import load_config
-
-
-def _get_os() -> str:
-    try:
-        return load_config().get("os_system", "windows").lower()
-    except Exception:
-        return "windows"
+from config import get_os
 
 
 def _scripts_dir() -> Path:
@@ -295,7 +288,7 @@ def reminder(
     if target_dt <= datetime.now():
         return "That time has already passed — I can't set a reminder in the past."
 
-    os_name    = _get_os()
+    os_name    = get_os()
     safe_msg   = _sanitise(message)
     task_name  = f"JARVISReminder_{target_dt.strftime('%Y%m%d_%H%M%S')}"
 

@@ -193,11 +193,14 @@ def call_llm(
 
     if provider == "openai":
         endpoint = f"{url}/v1/chat/completions"
+        # 150 tokens is sized for a spoken reply; a tool call still has to fit
+        # its name + JSON arguments in that same budget, so give tool-bearing
+        # requests more headroom (500) to avoid truncating mid-JSON.
         payload: dict = {
             "model":      model,
             "messages":   messages,
             "stream":     False,
-            "max_tokens": 150,
+            "max_tokens": 500 if tools else 150,
         }
         if tools:
             payload["tools"]       = tools
@@ -232,12 +235,15 @@ def call_llm(
 
     # ── Ollama ──────────────────────────────────────────────────────────────
     endpoint = f"{url}/api/chat"
+    # 150 tokens is sized for a spoken reply; a tool call still has to fit
+    # its name + JSON arguments in that same budget, so give tool-bearing
+    # requests more headroom (500) to avoid truncating mid-JSON.
     payload = {
         "model":      model,
         "messages":   messages,
         "stream":     False,
         "keep_alive": -1,
-        "options":    {"num_predict": 150, "num_gpu": 99},
+        "options":    {"num_predict": 500 if tools else 150, "num_gpu": 99},
     }
     if tools:
         payload["tools"] = tools
@@ -377,11 +383,14 @@ def _stream_openai(
     url, model = get_llm_settings()
     endpoint   = f"{url}/v1/chat/completions"
 
+    # 150 tokens is sized for a spoken reply; a tool call still has to fit
+    # its name + JSON arguments in that same budget, so give tool-bearing
+    # requests more headroom (500) to avoid truncating mid-JSON.
     payload: dict = {
         "model":      model,
         "messages":   messages,
         "stream":     True,
-        "max_tokens": 150,
+        "max_tokens": 500 if tools else 150,
     }
     if tools:
         payload["tools"]       = tools
@@ -507,9 +516,15 @@ def call_llm_stream(
         "messages":   messages,
         "stream":     True,
         "keep_alive": -1,
-        # 150 tokens ≈ 100 words ≈ 3-4 sentences — enough for any voice reply.
+        # 150 tokens ≈ 100 words ≈ 3-4 sentences — enough for any voice reply
+        # with no tools attached. But a tool call has to fit its name + JSON
+        # arguments in that same budget, so tool-bearing requests get 500
+        # instead — otherwise a multi-tool call or one with a long argument
+        # (e.g. file_controller content, code_helper's code param) truncates
+        # mid-JSON and fails to parse. Most turns still stop well short of
+        # 500 via natural stop tokens — this is a ceiling, not a target.
         # num_gpu:99 pushes all layers to GPU; num_thread removed (Ollama auto-tunes).
-        "options":    {"num_predict": 150, "num_gpu": 99},
+        "options":    {"num_predict": 500 if tools else 150, "num_gpu": 99},
     }
     if tools:
         payload["tools"] = tools

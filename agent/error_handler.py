@@ -129,11 +129,4 @@ Return ONLY the Python code, no explanation."""
         }
     except Exception as e:
         print(f"[ErrorHandler] ⚠️ Fix generation failed: {e}")
-        return {
-            "step":        step.get("step"),
-            "tool":        "generated_code",
-            "description": f"Fallback for: {step.get('description')}",
-            "parameters":  {"description": step.get("description", "")},
-            "depends_on":  step.get("depends_on", []),
-            "critical":    step.get("critical", False),
-        }
+        raise RuntimeError(f"Could not generate a fix: {e}")

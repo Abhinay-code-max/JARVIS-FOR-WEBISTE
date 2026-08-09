@@ -161,6 +161,23 @@ def _inject_context(params: dict, tool: str, step_results: dict, goal: str = "")
 # Tool routing
 # ---------------------------------------------------------------------------
 
+# Strings code_helper's "run" action returns when it did NOT actually
+# execute the auto-generated fix code — this executor always calls with
+# player=None, so:
+#   - generate_fix()'s fixed_step never includes a file_path (only raw
+#     "code"), so _run_action() short-circuits with the first marker
+#     before CONFIRM is even reached;
+#   - if that parameter gap is ever closed, the flow would instead reach
+#     core/confirm.py's CONFIRM.request(), which always denies with no
+#     live player (core/confirm.py:48) and returns the second marker.
+# Either way "recovery ran" is false — treat both as a failed step, not
+# a silent success.
+_RECOVERY_NOT_EXECUTED_MARKERS = (
+    "Please provide a file path to run",
+    "Cancelled — did not run",
+)
+
+
 def _call_tool(tool: str, parameters: dict, speak: Callable | None) -> str:
     if tool == "generated_code":
         description = parameters.get("description", "")
@@ -279,10 +296,19 @@ class AgentExecutor:
                                         fixed_step["parameters"],
                                         speak,
                                     )
-                                    step_results[step_num] = res
-                                    completed_steps.append(step)
-                                    step_ok = True
-                                    break
+                                    if isinstance(res, str) and any(
+                                        marker in res for marker in _RECOVERY_NOT_EXECUTED_MARKERS
+                                    ):
+                                        print(
+                                            f"[Executor] Recovery via code_helper was denied — no live user "
+                                            f"to confirm (player=None). Autonomous code-fix recovery cannot run in "
+                                            f"this context."
+                                        )
+                                    else:
+                                        step_results[step_num] = res
+                                        completed_steps.append(step)
+                                        step_ok = True
+                                        break
                                 except Exception as fix_err:
                                     print(f"[Executor] ⚠️ Fix failed: {fix_err}")
 

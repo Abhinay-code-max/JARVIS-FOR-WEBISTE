@@ -556,9 +556,6 @@ ACTION_MAP: dict[str, callable] = {
     "shutdown":            shutdown_computer,
 }
 
-_DANGEROUS_ACTIONS = {"restart", "shutdown"}
-
-
 
 def _detect_action(description: str) -> dict:
     from core.llm_client import call_llm_text
@@ -613,13 +610,12 @@ def computer_settings(
     if player:
         player.write_log(f"[Settings] {action}")
 
-    if action in _DANGEROUS_ACTIONS:
-        confirmed = str(params.get("confirmed", "")).lower()
-        if confirmed not in ("yes", "true", "1", "confirm"):
-            return (
-                f"This will {action} the computer. "
-                f"Please confirm by calling again with confirmed=yes."
-            )
+    # restart/shutdown confirmation now happens centrally at dispatch
+    # (core/tool_gate.py — permission_policy has a
+    # (computer_settings, restart|shutdown) ask-and-wait row) before
+    # computer_settings() is ever called — the old "call again with
+    # confirmed=yes" text-prompt trick is retired; it never went through
+    # CONFIRM.request() or the approvals audit trail.
 
     if action == "volume_set":
         try:

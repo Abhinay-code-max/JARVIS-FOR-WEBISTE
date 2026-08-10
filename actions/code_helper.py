@@ -170,10 +170,9 @@ def _run_file(path: Path, args: list, timeout: int, player=None, speak=None) -> 
     if not interp:
         return f"No interpreter for {path.suffix}."
 
-    from core.confirm import CONFIRM
-    if not CONFIRM.request(player, f"I'm about to run {path.name} with {interp[0]}", speak=speak):
-        return f"Cancelled — did not run {path.name}."
-
+    # Confirmation now happens centrally at dispatch (core/tool_gate.py,
+    # tool="code_helper" is ask-and-wait) before code_helper() is ever
+    # called — not here.
     try:
         result = subprocess.run(
             interp + [str(path)] + (args or []),

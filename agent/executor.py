@@ -18,6 +18,7 @@ from agent.planner       import create_plan, replan
 from agent.error_handler import analyze_error, generate_fix, ErrorDecision
 from core.llm_client     import call_llm_text
 from core.tool_dispatch  import TOOL_DISPATCH
+from core.tool_gate      import dispatch_tool
 from core.db             import log_task_event
 from config              import BASE_DIR
 
@@ -178,26 +179,45 @@ def _inject_context(
 # Tool routing
 # ---------------------------------------------------------------------------
 
-# Strings code_helper's "run" action returns when it did NOT actually
-# execute the auto-generated fix code — this executor always calls with
-# player=None, so:
-#   - generate_fix()'s fixed_step never includes a file_path (only raw
-#     "code"), so _run_action() short-circuits with the first marker
-#     before CONFIRM is even reached;
-#   - if that parameter gap is ever closed, the flow would instead reach
-#     core/confirm.py's CONFIRM.request(), which always denies with no
-#     live player (core/confirm.py:48) and returns the second marker.
-# Either way "recovery ran" is false — treat both as a failed step, not
-# a silent success.
+# code_helper's "run" action returns this when generate_fix()'s fixed_step
+# never included a file_path (only raw "code") — _run_action() short-
+# circuits before any permission gate is even reached. Distinct from an
+# approval-not-granted result (see _approval_outcome below), which is
+# detected by content rather than an exact marker since dispatch_tool's
+# two cancellation messages ("timed out waiting for approval" / "was not
+# approved") need to stay distinguishable, not collapsed into one marker.
 _RECOVERY_NOT_EXECUTED_MARKERS = (
     "Please provide a file path to run",
-    "Cancelled — did not run",
 )
+
+
+def _approval_outcome(result) -> str | None:
+    """If `result` is one of core/tool_gate.py's ask-and-wait cancellation
+    strings, returns 'timeout' or 'denied'; else None. This executor
+    always calls dispatch_tool with player=None, so an ask-and-wait tool
+    blocks on core/task_approval.py's TASK_APPROVAL (no live player to
+    answer synchronously) — up to TASK_APPROVAL.DEFAULT_TIMEOUT waiting for
+    a human to call approve_task, then this fires on timeout just as it
+    would on an explicit deny.
+
+    Callers must treat either outcome as a real, terminal step failure —
+    dispatch_tool returns a plain string here (not an exception, matching
+    every other action module's error-signaling convention in this
+    codebase), so nothing else makes it fail; skipping this check would
+    silently log the step as 'done'."""
+    if not isinstance(result, str):
+        return None
+    if "timed out waiting for approval" in result:
+        return "timeout"
+    if "was not approved" in result:
+        return "denied"
+    return None
 
 
 def _call_tool(
     tool: str, parameters: dict, speak: Callable | None,
     task_id: str | None = None, step_num=None,
+    submitted_interactively: bool = True,
 ) -> str:
     if tool == "generated_code":
         description = parameters.get("description", "")
@@ -209,8 +229,12 @@ def _call_tool(
         # player=None: this executor runs without a live UI/session — the
         # shared wrappers in core/tool_dispatch.py already handle that
         # (e.g. file_processor's current_file lookup no-ops when player
-        # has no such attribute).
-        return TOOL_DISPATCH[tool](parameters, None, speak)
+        # has no such attribute). Policy evaluation + gating happens in
+        # dispatch_tool(), not here — see core/tool_gate.py.
+        return dispatch_tool(
+            tool, parameters, None, speak,
+            task_id=task_id, submitted_interactively=submitted_interactively,
+        )
 
     else:
         raise ValueError(
@@ -233,6 +257,7 @@ class AgentExecutor:
         speak:       Callable | None        = None,
         cancel_flag: threading.Event | None = None,
         task_id:     str | None             = None,
+        submitted_interactively: bool       = True,
     ) -> str:
         _log.info("Goal: %s", goal, extra={"task_id": task_id})
 
@@ -273,7 +298,35 @@ class AgentExecutor:
                     if cancel_flag and cancel_flag.is_set():
                         break
                     try:
-                        result = _call_tool(tool, params, speak, task_id=task_id, step_num=step_num)
+                        result = _call_tool(
+                            tool, params, speak, task_id=task_id, step_num=step_num,
+                            submitted_interactively=submitted_interactively,
+                        )
+
+                        approval_outcome = _approval_outcome(result)
+                        if approval_outcome:
+                            # A permission denial/timeout isn't a transient
+                            # or fixable error — retrying won't change a
+                            # human's answer, and the REPLAN branch below
+                            # always retargets code_helper via generate_fix
+                            # (also ask-and-wait), which could cascade into
+                            # another up-to-30-minute wait for no benefit.
+                            # Fail this step immediately with a distinct,
+                            # greppable reason and let the *task-level*
+                            # replanner (outside this step, further down)
+                            # decide whether a different overall approach
+                            # is worth trying — not this same blocking call
+                            # retried blindly.
+                            detail = f"approval_{approval_outcome}: {result}"
+                            log_task_event(
+                                task_id, step_num, tool, desc, "failed", detail,
+                                duration_ms=int((time.monotonic() - step_start) * 1000),
+                            )
+                            failed_step  = step
+                            failed_error = detail
+                            success      = False
+                            break
+
                         step_results[step_num] = result
                         completed_steps.append(step)
                         log_task_event(
@@ -333,18 +386,31 @@ class AgentExecutor:
                                         fixed_step["parameters"],
                                         speak,
                                         task_id=task_id, step_num=step_num,
+                                        submitted_interactively=submitted_interactively,
                                     )
-                                    if isinstance(res, str) and any(
+                                    res_approval_outcome = _approval_outcome(res)
+                                    res_no_file_path = isinstance(res, str) and any(
                                         marker in res for marker in _RECOVERY_NOT_EXECUTED_MARKERS
-                                    ):
-                                        _log.info(
-                                            "Recovery via code_helper was denied — no live user to confirm "
-                                            "(player=None). Autonomous code-fix recovery cannot run in this context.",
-                                            extra={"task_id": task_id},
-                                        )
+                                    )
+                                    if res_approval_outcome or res_no_file_path:
+                                        if res_approval_outcome:
+                                            reason = f"approval_{res_approval_outcome}"
+                                            _log.info(
+                                                "Recovery via code_helper was not approved (%s; no live "
+                                                "player to confirm synchronously). Autonomous code-fix "
+                                                "recovery cannot complete in this context.",
+                                                res_approval_outcome, extra={"task_id": task_id},
+                                            )
+                                        else:
+                                            reason = "missing_file_path"
+                                            _log.info(
+                                                "Recovery via code_helper did not run — no file_path in "
+                                                "the generated fix step.",
+                                                extra={"task_id": task_id},
+                                            )
                                         log_task_event(
                                             task_id, step_num, tool, desc, "failed",
-                                            "recovery fix denied — no live user to confirm (player=None)",
+                                            f"recovery fix did not execute ({reason}): {res}",
                                             duration_ms=int((time.monotonic() - step_start) * 1000),
                                         )
                                     else:

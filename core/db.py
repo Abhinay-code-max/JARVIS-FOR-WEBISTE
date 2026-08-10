@@ -89,6 +89,19 @@ CREATE TABLE IF NOT EXISTS memory_entries (
 );
 CREATE INDEX IF NOT EXISTS idx_memory_updated ON memory_entries(store, updated_at);
 
+-- outcome vocabulary: NULL (interactive CONFIRM.request() mid-flight,
+-- answered_at not yet set — always resolves within its own timeout, never
+-- left this way), 'approved' | 'denied' | 'timeout' (a resolved yes/no —
+-- 'timeout' covers both CONFIRM's ~45s interactive wait and
+-- core/task_approval.py's longer background wait elapsing while the app
+-- was still live), 'pending' (core/task_approval.py's TASK_APPROVAL: a
+-- background ask-and-wait step paused awaiting approve_task), 'expired'
+-- (a 'pending' row reconciled at startup with no live worker thread left
+-- to resume it — see agent/task_queue.py's _reconcile_orphaned_approvals;
+-- distinct from 'timeout' because the wait itself never got the chance to
+-- elapse), 'no_player' (core/confirm.py's own instant fail-closed path,
+-- still reachable for the delegated tools in core/tool_gate.DELEGATED_TOOLS
+-- when called with no live player).
 CREATE TABLE IF NOT EXISTS approvals (
     approval_id  INTEGER PRIMARY KEY AUTOINCREMENT,
     prompt       TEXT NOT NULL,
@@ -102,6 +115,39 @@ CREATE TABLE IF NOT EXISTS contacts (
     alias      TEXT PRIMARY KEY,
     exact_name TEXT NOT NULL
 );
+
+-- tool_name -> default permission level (auto-allow | notify-only |
+-- ask-and-wait | hard-deny). `action` is nullable: NULL is the tool-wide
+-- default row, a specific value overrides it for tools split by action
+-- (computer_control, browser_control, file_controller, computer_settings,
+-- file_processor, game_updater — see core/policy.py). No UNIQUE/PK
+-- constraint on (tool_name, action) because SQLite doesn't dedupe NULLs
+-- there; core/policy.py's seed function is idempotent via a row-count
+-- check instead (same pattern as the memory/contacts migrations above).
+CREATE TABLE IF NOT EXISTS permission_policy (
+    tool_name TEXT NOT NULL,
+    action    TEXT,
+    level     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_permission_policy_tool ON permission_policy(tool_name);
+
+-- One row per TOOL_DISPATCH call (core/tool_gate.py's dispatch_tool),
+-- regardless of the level it evaluated to — auto-allow and notify-only
+-- included, not just the subset that reach a blocking confirmation.
+-- `outcome` for delegated tools (dev_agent, vision_fix_code) is literally
+-- 'delegated' — the real yes/no decision(s) for those live in `approvals`,
+-- joined by task_id/time, because those tools gate mid-flow with
+-- content-specific prompts a single dispatch-entry row can't capture.
+CREATE TABLE IF NOT EXISTS policy_decisions (
+    decision_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    tool_name       TEXT NOT NULL,
+    action          TEXT,
+    level_evaluated TEXT NOT NULL,
+    outcome         TEXT NOT NULL,
+    task_id         TEXT,
+    created_at      REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_policy_decisions_task_id ON policy_decisions(task_id);
 """
 
 

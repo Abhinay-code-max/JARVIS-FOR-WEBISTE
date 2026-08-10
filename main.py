@@ -98,7 +98,9 @@ from recognition.voice_id import VoiceIdentifier
 from recognition.wake_word import WakeWordDetector
 
 from core.tool_dispatch import TOOL_DISPATCH
+from core.tool_gate import dispatch_tool
 from core.confirm import CONFIRM
+from core.task_approval import TASK_APPROVAL
 from config import load_config, BASE_DIR
 
 _log      = logging.getLogger("jarvis.main")
@@ -367,6 +369,31 @@ TOOL_DECLARATIONS = [
                 }
             },
             "required": ["goal"]
+        }
+    },
+    {
+        "name": "list_pending_approvals",
+        "description": (
+            "List background tasks that are paused waiting on a yes/no "
+            "approval — use when the user asks 'what's pending', 'anything "
+            "waiting on me', or similar."
+        ),
+        "parameters": {"type": "OBJECT", "properties": {}, "required": []}
+    },
+    {
+        "name": "approve_task",
+        "description": (
+            "Approve or deny a paused background-task step by its approval "
+            "ID (from list_pending_approvals). Use when the user says "
+            "'approve #5', 'yes, let task X do that', 'deny approval 3', etc."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "approval_id": {"type": "INTEGER", "description": "The approval ID to resolve."},
+                "approve":     {"type": "BOOLEAN", "description": "true to approve, false to deny. Default true."},
+            },
+            "required": ["approval_id"]
         }
     },
     {
@@ -1024,11 +1051,34 @@ class JarvisXL:
                 priority    = priority,
                 speak       = self.speak,
                 on_complete = _on_done,
+                submitted_interactively = True,
             )
             self.ui.write_log(f"AGENT: [{task_id}] started — {goal[:60]}")
             if not self.ui.muted:
                 self.ui.set_state("LISTENING")
             return f"Working on that in the background, sir. Task {task_id}."
+
+        if name == "list_pending_approvals":
+            pending = TASK_APPROVAL.list_pending()
+            if not pending:
+                return "No background tasks are waiting on approval right now."
+            lines = [
+                f"#{p['approval_id']} (task {p['task_id']}): {p['prompt']}"
+                for p in pending
+            ]
+            return f"{len(pending)} pending approval(s):\n" + "\n".join(lines)
+
+        if name == "approve_task":
+            approval_id = args.get("approval_id")
+            try:
+                approval_id = int(approval_id)
+            except (TypeError, ValueError):
+                return "Please give me a valid approval ID — say 'list pending approvals' to see them."
+            approve = str(args.get("approve", "true")).strip().lower() not in ("false", "no", "0", "deny", "denied")
+            ok = TASK_APPROVAL.answer(approval_id, approve)
+            if not ok:
+                return f"Approval #{approval_id} isn't waiting on a decision — it may already be resolved or never existed."
+            return f"Approval #{approval_id} {'granted' if approve else 'denied'}. The task will continue shortly."
 
         result = "Done."
         try:
@@ -1043,7 +1093,7 @@ class JarvisXL:
                 return "Shutting down."
 
             elif name in TOOL_DISPATCH:
-                result = TOOL_DISPATCH[name](args, self.ui, self.speak)
+                result = dispatch_tool(name, args, self.ui, self.speak, task_id=None)
 
             else:
                 result = f"Unknown tool: {name}"

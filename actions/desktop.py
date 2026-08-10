@@ -77,7 +77,7 @@ def _build_sandbox() -> dict:
     return sandbox
 
 
-def _execute_generated_code(code: str, player=None, speak=None) -> str:
+def _execute_generated_code(code: str) -> str:
     if not code or code.strip() == "UNSAFE":
         return "This action cannot be performed safely."
 
@@ -86,11 +86,10 @@ def _execute_generated_code(code: str, player=None, speak=None) -> str:
         lines = code.split("\n")
         code  = "\n".join(lines[1:-1]).strip()
 
-    from core.confirm import CONFIRM
-    preview = code if len(code) <= 200 else code[:200] + "..."
-    if not CONFIRM.request(player, f"I'm about to run this generated code:\n{preview}", speak=speak):
-        return "Cancelled — did not run the generated code."
-
+    # Confirmation now happens centrally at dispatch (core/tool_gate.py,
+    # tool="desktop_control" is ask-and-wait) before desktop_control() is
+    # ever called — not here. See core/tool_gate.DELEGATED_TOOLS for the
+    # (different) tools that still gate internally.
     sandbox      = _build_sandbox()
     output_lines = []
     sandbox["__builtins__"]["print"] = lambda *a: output_lines.append(" ".join(str(x) for x in a))
@@ -451,12 +450,12 @@ def desktop_control(
                 player.write_log("[Desktop] Generating action...")
 
             code = _ask_gemini_for_desktop_action(actual_task)
-            return _execute_generated_code(code, player=player, speak=speak)
+            return _execute_generated_code(code)
 
         else:
             if action:
                 code = _ask_gemini_for_desktop_action(action)
-                return _execute_generated_code(code, player=player, speak=speak)
+                return _execute_generated_code(code)
             return "No action or task specified."
 
     except Exception as e:

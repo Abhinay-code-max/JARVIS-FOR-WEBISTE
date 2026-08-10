@@ -38,6 +38,13 @@ class Task:
     speak:       Any        = field(compare=False, default=None)
     on_complete: Any        = field(compare=False, default=None)
     cancel_flag: threading.Event = field(compare=False, default_factory=threading.Event)
+    # Whether a live interactive session submitted this task (vs. some
+    # future system/scheduled trigger). Threaded through to policy
+    # evaluation for the task's steps (core/tool_gate.dispatch_tool) —
+    # doesn't change *whether* an ask-and-wait step pauses (player is None
+    # either way on this thread, see agent/executor.py), only the context
+    # noted on the resulting approval prompt.
+    submitted_interactively: bool = field(compare=False, default=True)
 
 
 def _reconcile_interrupted_tasks() -> None:
@@ -55,6 +62,36 @@ def _reconcile_interrupted_tasks() -> None:
         n = cur.rowcount
     if n:
         _log.warning("Marked %d orphaned task(s) from a previous run as interrupted.", n)
+
+
+def _reconcile_orphaned_approvals() -> None:
+    """Called once at startup, in the same reconciliation pass as
+    _reconcile_interrupted_tasks (see TaskQueue.start()) — same rationale,
+    different table: a background ask-and-wait approval
+    (core/task_approval.py's TASK_APPROVAL) still 'pending' from a
+    previous process lifetime has no live worker thread left to resume
+    it. TASK_APPROVAL's pending-approval registry is in-memory only and
+    doesn't survive a restart, so nothing will ever call answer() on it —
+    and by the time this runs (start of TaskQueue.start(), before any
+    worker thread exists), that's true of every 'pending' row without
+    needing to cross-reference which task it belongs to.
+
+    Marked 'expired', not reused as 'timeout' — 'timeout' already means
+    something more specific in this vocabulary (an in-process wait that
+    elapsed while the app was still live and could have been answered);
+    collapsing the two would make that distinction unrecoverable in the
+    audit trail. See core/db.py's approvals table for the full outcome
+    vocabulary this stays consistent with (approved | denied | timeout |
+    expired | pending | no_player)."""
+    conn = get_conn()
+    with conn:
+        cur = conn.execute(
+            "UPDATE approvals SET answered_at = ?, outcome = 'expired' WHERE outcome = 'pending'",
+            (time.time(),),
+        )
+        n = cur.rowcount
+    if n:
+        _log.warning("Marked %d orphaned approval(s) from a previous run as expired.", n)
 
 
 class TaskQueue:
@@ -93,6 +130,7 @@ class TaskQueue:
         if self._running:
             return
         _reconcile_interrupted_tasks()
+        _reconcile_orphaned_approvals()
         self._running      = True
         self._worker_thread = threading.Thread(
             target=self._worker_loop,
@@ -114,6 +152,7 @@ class TaskQueue:
         priority:    TaskPriority = TaskPriority.NORMAL,
         speak:       Callable | None = None,
         on_complete: Callable | None = None,
+        submitted_interactively: bool = True,
     ) -> str:
 
         task_id = str(uuid.uuid4())[:8]
@@ -124,6 +163,7 @@ class TaskQueue:
             goal        = goal,
             speak       = speak,
             on_complete = on_complete,
+            submitted_interactively = submitted_interactively,
         )
 
         with self._condition:
@@ -233,6 +273,7 @@ class TaskQueue:
                 speak       = task.speak,
                 cancel_flag = task.cancel_flag,
                 task_id     = task.task_id,
+                submitted_interactively = task.submitted_interactively,
             )
 
             with self._lock:

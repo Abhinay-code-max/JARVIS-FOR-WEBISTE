@@ -159,7 +159,8 @@ def set_wallpaper(image_path: str) -> str:
                 f'tell application "System Events" to tell every desktop to '
                 f'set picture to POSIX file "{path}"'
             )
-            subprocess.run(["osascript", "-e", script], capture_output=True)
+            # 5s: a simple AppleScript one-liner setting the desktop picture.
+            subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
             return f"Wallpaper set: {path.name}"
 
         else:
@@ -167,14 +168,15 @@ def set_wallpaper(image_path: str) -> str:
             uri = f"file://{path}"
 
             if "gnome" in desktop_env or "unity" in desktop_env:
+                # 5s each: fast local dconf writes.
                 subprocess.run([
                     "gsettings", "set", "org.gnome.desktop.background",
                     "picture-uri", uri
-                ], capture_output=True)
+                ], capture_output=True, timeout=5)
                 subprocess.run([
                     "gsettings", "set", "org.gnome.desktop.background",
                     "picture-uri-dark", uri
-                ], capture_output=True)
+                ], capture_output=True, timeout=5)
 
             elif "kde" in desktop_env:
                 # KDE Plasma
@@ -187,23 +189,28 @@ for (var i = 0; i < allDesktops.length; i++) {{
     d.writeConfig("Image", "file://{path}");
 }}
 """
+                # 10s: a D-Bus call that has Plasma evaluate a JS wallpaper
+                # script and re-render, not just a plain settings write.
                 subprocess.run(
                     ["qdbus", "org.kde.plasmashell", "/PlasmaShell",
                      "org.kde.PlasmaShell.evaluateScript", script],
-                    capture_output=True
+                    capture_output=True, timeout=10
                 )
 
             elif "xfce" in desktop_env:
+                # 5s: fast local xfconf write.
                 subprocess.run([
                     "xfconf-query", "-c", "xfce4-desktop",
                     "-p", "/backdrop/screen0/monitor0/workspace0/last-image",
                     "-s", str(path)
-                ], capture_output=True)
+                ], capture_output=True, timeout=5)
 
             else:
+                # 10s: feh actually decodes and renders the image, not just
+                # a settings write — a bit more headroom for a large file.
                 result = subprocess.run(
                     ["feh", "--bg-scale", str(path)],
-                    capture_output=True
+                    capture_output=True, timeout=10
                 )
                 if result.returncode != 0:
                     return (
@@ -250,7 +257,7 @@ def get_current_wallpaper() -> str:
             )
             result = subprocess.run(
                 ["osascript", "-e", script],
-                capture_output=True, text=True
+                capture_output=True, text=True, timeout=5
             )
             return f"Current wallpaper: {result.stdout.strip()}"
 
@@ -259,7 +266,7 @@ def get_current_wallpaper() -> str:
             if "gnome" in desktop_env or "unity" in desktop_env:
                 result = subprocess.run(
                     ["gsettings", "get", "org.gnome.desktop.background", "picture-uri"],
-                    capture_output=True, text=True
+                    capture_output=True, text=True, timeout=5
                 )
                 return f"Current wallpaper: {result.stdout.strip()}"
             return "Wallpaper path retrieval not supported for this desktop environment."

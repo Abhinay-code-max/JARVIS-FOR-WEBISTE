@@ -5,23 +5,37 @@ Single chokepoint for every TOOL_DISPATCH call. main.py's interactive
 _execute_tool (player=self.ui) and agent/executor.py's _call_tool
 (player=None, always — see core/confirm.py) both route through
 dispatch_tool() instead of indexing TOOL_DISPATCH directly, so policy
-evaluation and audit logging happen in exactly one place instead of being
-scattered as per-action-module CONFIRM calls.
+evaluation, input validation, execution timeout, and audit logging all
+happen in exactly one place instead of being scattered across 19 modules.
 
 DELEGATED_TOOLS keep their own internal CONFIRM.request() call(s) instead
 of being gated here — see the constant's docstring for why those two
-specifically can't be replaced by a single entry-level ask.
+specifically can't be replaced by a single entry-level ask. They still go
+through input validation and the timeout wrapper below.
+
+Thread-affinity note (see _invoke_with_timeout): timeout enforcement runs
+the underlying TOOL_DISPATCH[tool] call on a fresh daemon thread. Verified
+empirically that pyautogui-based tools (computer_control, computer_settings,
+desktop.py, send_message.py) have no thread-affinity issue — read-only
+pyautogui calls succeed identically from a worker thread. youtube_video is
+the one exception (core/tool_contracts.py sets enforce_timeout=False for
+it): its _ask_for_url() creates a real tkinter Tk root, and tkinter/Tcl is
+not safe to abandon mid-call from a different thread than the one that
+created the root — a timeout there wouldn't cleanly cancel the dialog, it
+would corrupt the process-global tk._default_root for every later call.
 """
 from __future__ import annotations
 
 import logging
+import threading
 import time
 
-from core.tool_dispatch  import TOOL_DISPATCH
-from core.confirm        import CONFIRM
-from core.policy         import get_policy_level, ACTION_EXTRACTORS, ASK_AND_WAIT, HARD_DENY, AUTO_ALLOW, NOTIFY_ONLY
-from core.task_approval  import TASK_APPROVAL
-from core.db              import get_conn
+from core.tool_dispatch    import TOOL_DISPATCH
+from core.tool_contracts   import get_contract, ToolContract
+from core.confirm          import CONFIRM
+from core.policy           import get_policy_level, ACTION_EXTRACTORS, ASK_AND_WAIT, HARD_DENY, AUTO_ALLOW, NOTIFY_ONLY
+from core.task_approval    import TASK_APPROVAL
+from core.db                import get_conn
 
 _log = logging.getLogger("jarvis.tool_gate")
 
@@ -61,6 +75,135 @@ def _log_decision(tool: str, action: str | None, level: str, outcome: str, task_
         _log.warning("Could not log policy decision (%s/%s): %s", tool, action, e)
 
 
+# ---------------------------------------------------------------------------
+# Input validation
+# ---------------------------------------------------------------------------
+
+# INTEGER/NUMBER accept numeric strings too, not just python int/float —
+# matched to the actual crash risk found in the codebase (e.g.
+# flight_finder's int(params.get("passengers", 1)), computer_control's
+# int(params.get("x", 0))): those coercions succeed on "5" just as well as
+# on 5, so rejecting a numeric string here would be stricter than the tool
+# itself needs. What DOES crash them is a non-numeric value ("two", a
+# list, etc.) — that's what gets caught.
+def _is_integer_like(v) -> bool:
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, int):
+        return True
+    if isinstance(v, str):
+        try:
+            int(v)
+            return True
+        except ValueError:
+            return False
+    return False
+
+
+def _is_number_like(v) -> bool:
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, (int, float)):
+        return True
+    if isinstance(v, str):
+        try:
+            float(v)
+            return True
+        except ValueError:
+            return False
+    return False
+
+
+_TYPE_CHECKERS = {
+    "STRING":  lambda v: isinstance(v, str),
+    "INTEGER": _is_integer_like,
+    "NUMBER":  _is_number_like,
+    "BOOLEAN": lambda v: isinstance(v, bool),
+    "ARRAY":   lambda v: isinstance(v, list),
+    "OBJECT":  lambda v: isinstance(v, dict),
+}
+
+
+def validate_input(tool: str, args: dict, schema: dict) -> str | None:
+    """Returns None if `args` satisfies `schema` (TOOL_DECLARATIONS'
+    Gemini-style {type, properties, required} shape), else a short
+    human-readable description of what's wrong — required-but-missing
+    field(s), or a field whose value the underlying tool would crash on
+    (see _TYPE_CHECKERS). Unknown/extra keys are tolerated, not rejected —
+    an LLM occasionally adding a harmless extra field isn't worth the
+    friction of rejecting the whole call over."""
+    if not isinstance(args, dict):
+        return f"parameters must be an object, got {type(args).__name__}."
+
+    props    = schema.get("properties", {})
+    required = schema.get("required", [])
+
+    missing = [f for f in required if args.get(f) in (None, "")]
+    if missing:
+        return f"missing required parameter(s): {', '.join(missing)}."
+
+    for key, value in args.items():
+        if key not in props or value is None:
+            continue
+        expected_type = props[key].get("type")
+        checker = _TYPE_CHECKERS.get(expected_type)
+        if checker and not checker(value):
+            return (
+                f"parameter '{key}' should be {expected_type.lower()}, "
+                f"got {type(value).__name__} ({value!r})."
+            )
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Execution timeout
+# ---------------------------------------------------------------------------
+
+def _invoke_with_timeout(tool: str, args: dict, player, speak, contract: ToolContract) -> str:
+    """Runs TOOL_DISPATCH[tool] under contract.timeout_seconds. Spawns a
+    plain daemon Thread rather than a shared ThreadPoolExecutor — a pool's
+    worker threads are non-daemon by default and concurrent.futures
+    registers an atexit hook that joins them, so a single genuinely hung
+    tool call (see the still-bare subprocess.run() calls in
+    computer_settings.py/desktop.py/game_updater.py/reminder.py, a
+    separate follow-up) would hang the whole process's normal shutdown.
+    A daemon thread can be abandoned on timeout without blocking exit —
+    the OS reclaims it when the process ends. This does NOT kill the
+    underlying subprocess/syscall the tool made; see the module docstring
+    and core/tool_contracts.py for which tools are exempted (enforce_timeout)
+    because abandonment itself is unsafe for them, not just incomplete."""
+    if not contract.enforce_timeout:
+        return TOOL_DISPATCH[tool](args, player, speak)
+
+    box: dict = {}
+
+    def _run():
+        try:
+            box["value"] = TOOL_DISPATCH[tool](args, player, speak)
+        except Exception as e:
+            box["error"] = e
+
+    t = threading.Thread(target=_run, name=f"tool-exec-{tool}", daemon=True)
+    t.start()
+    t.join(timeout=contract.timeout_seconds)
+
+    if t.is_alive():
+        _log.warning(
+            "Tool '%s' exceeded its %.0fs timeout — abandoning (thread left running).",
+            tool, contract.timeout_seconds,
+        )
+        return f"'{tool}' did not complete within {contract.timeout_seconds:.0f}s and was abandoned."
+
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
 def dispatch_tool(
     tool: str,
     args: dict,
@@ -69,33 +212,40 @@ def dispatch_tool(
     task_id: str | None = None,
     submitted_interactively: bool = True,
 ) -> str:
-    """Evaluates permission_policy for (tool, action), gates as needed,
-    then calls TOOL_DISPATCH[tool]. Never call this from the audio/
-    transcript thread — same rule as CONFIRM.request()."""
+    """Validates input, evaluates permission_policy for (tool, action),
+    gates as needed, then calls TOOL_DISPATCH[tool] under its contract's
+    timeout. Never call this from the audio/transcript thread — same rule
+    as CONFIRM.request()."""
     if tool not in TOOL_DISPATCH:
         raise ValueError(
             f"Unknown tool '{tool}' — no such tool exists. "
             f"Available tools: {sorted(TOOL_DISPATCH.keys())}"
         )
 
-    action = _extract_action(tool, args)
-    level  = get_policy_level(tool, action)
+    contract = get_contract(tool)
+    action   = _extract_action(tool, args)
+    level    = get_policy_level(tool, action)
+
+    validation_error = validate_input(tool, args, contract.input_schema)
+    if validation_error:
+        _log_decision(tool, action, level, "rejected", task_id)
+        return f"Rejected — '{tool}' parameters are invalid: {validation_error}"
 
     if tool in DELEGATED_TOOLS:
         _log_decision(tool, action, level, "delegated", task_id)
-        return TOOL_DISPATCH[tool](args, player, speak)
+        return _invoke_with_timeout(tool, args, player, speak, contract)
 
     if level == HARD_DENY:
         _log_decision(tool, action, level, "denied", task_id)
         return f"'{tool}' is not permitted."
 
     if level == AUTO_ALLOW:
-        result = TOOL_DISPATCH[tool](args, player, speak)
+        result = _invoke_with_timeout(tool, args, player, speak, contract)
         _log_decision(tool, action, level, "auto-allowed", task_id)
         return result
 
     if level == NOTIFY_ONLY:
-        result = TOOL_DISPATCH[tool](args, player, speak)
+        result = _invoke_with_timeout(tool, args, player, speak, contract)
         if player is not None:
             try:
                 player.write_log(f"NOTICE: ran {tool}" + (f" ({action})" if action else ""))
@@ -124,4 +274,4 @@ def dispatch_tool(
         if outcome == "timeout":
             return f"Cancelled — '{tool}' timed out waiting for approval."
         return f"Cancelled — '{tool}' was not approved."
-    return TOOL_DISPATCH[tool](args, player, speak)
+    return _invoke_with_timeout(tool, args, player, speak, contract)

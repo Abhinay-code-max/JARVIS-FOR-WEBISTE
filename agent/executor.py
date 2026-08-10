@@ -19,6 +19,7 @@ from agent.error_handler import analyze_error, generate_fix, ErrorDecision
 from core.llm_client     import call_llm_text
 from core.tool_dispatch  import TOOL_DISPATCH
 from core.tool_gate      import dispatch_tool
+from core.tool_contracts import get_contract
 from core.db             import log_task_event
 from config              import BASE_DIR
 
@@ -214,6 +215,47 @@ def _approval_outcome(result) -> str | None:
     return None
 
 
+def _short_circuit_reason(result) -> str | None:
+    """Classifies a dispatch_tool() string result that must fail the step
+    immediately — never retried, never routed through analyze_error's
+    RETRY branch — because retrying wouldn't help (a bad permission
+    decision or invalid parameters won't change on a blind re-run) or
+    could be actively harmful: an execution-timeout's underlying call was
+    *abandoned*, not cancelled (see core/tool_gate.py's
+    _invoke_with_timeout) — its daemon thread may still be running, so an
+    immediate retry risks a second concurrent execution of a tool that was
+    deemed non-idempotent enough to time-box in the first place.
+
+    Returns a short reason tag ('approval_timeout' | 'approval_denied' |
+    'validation_failed' | 'execution_timeout') or None if `result` is an
+    ordinary tool result that should proceed normally."""
+    outcome = _approval_outcome(result)
+    if outcome:
+        return f"approval_{outcome}"
+    if isinstance(result, str):
+        if result.startswith("Rejected — "):
+            return "validation_failed"
+        if "did not complete within" in result and "was abandoned" in result:
+            return "execution_timeout"
+    return None
+
+
+def _maybe_downgrade_retry(tool: str, decision: ErrorDecision, task_id: str | None) -> ErrorDecision:
+    """A genuinely caught exception (unlike a short-circuited timeout —
+    see _short_circuit_reason) means the previous attempt has definitely
+    finished, so retrying isn't itself unsafe the way it is there. But if
+    the tool's own contract says re-running the exact same call isn't
+    idempotency-safe, a RETRY decision from analyze_error is downgraded to
+    REPLAN (try a different approach) rather than honored as-is."""
+    if decision == ErrorDecision.RETRY and not get_contract(tool).retryable:
+        _log.info(
+            "Tool '%s' is not retryable per its contract — treating RETRY as REPLAN.",
+            tool, extra={"task_id": task_id},
+        )
+        return ErrorDecision.REPLAN
+    return decision
+
+
 def _call_tool(
     tool: str, parameters: dict, speak: Callable | None,
     task_id: str | None = None, step_num=None,
@@ -303,21 +345,22 @@ class AgentExecutor:
                             submitted_interactively=submitted_interactively,
                         )
 
-                        approval_outcome = _approval_outcome(result)
-                        if approval_outcome:
-                            # A permission denial/timeout isn't a transient
-                            # or fixable error — retrying won't change a
-                            # human's answer, and the REPLAN branch below
-                            # always retargets code_helper via generate_fix
-                            # (also ask-and-wait), which could cascade into
-                            # another up-to-30-minute wait for no benefit.
-                            # Fail this step immediately with a distinct,
-                            # greppable reason and let the *task-level*
-                            # replanner (outside this step, further down)
-                            # decide whether a different overall approach
-                            # is worth trying — not this same blocking call
-                            # retried blindly.
-                            detail = f"approval_{approval_outcome}: {result}"
+                        short_circuit = _short_circuit_reason(result)
+                        if short_circuit:
+                            # None of these are transient or fixable by
+                            # blindly re-running the same call — see
+                            # _short_circuit_reason's docstring for why
+                            # each of the four reasons ends here instead
+                            # of going through analyze_error's RETRY
+                            # branch or the REPLAN-fix cascade (which
+                            # itself retargets code_helper — also gated —
+                            # and could stack another long wait for no
+                            # benefit). Fail this step immediately with a
+                            # distinct, greppable reason and let the
+                            # *task-level* replanner (outside this step,
+                            # further down) decide whether a different
+                            # overall approach is worth trying.
+                            detail = f"{short_circuit}: {result}"
                             log_task_event(
                                 task_id, step_num, tool, desc, "failed", detail,
                                 duration_ms=int((time.monotonic() - step_start) * 1000),
@@ -347,6 +390,12 @@ class AgentExecutor:
                         recovery = analyze_error(step, error_msg, attempt=attempt, task_id=task_id)
                         decision = recovery["decision"]
                         user_msg = recovery.get("user_message", "")
+
+                        # A genuinely caught exception (unlike a timeout,
+                        # this means the previous attempt has definitely
+                        # finished — no thread left running) can still be
+                        # gated by the tool's own idempotency.
+                        decision = _maybe_downgrade_retry(tool, decision, task_id)
 
                         if speak and user_msg:
                             speak(user_msg)
@@ -388,18 +437,19 @@ class AgentExecutor:
                                         task_id=task_id, step_num=step_num,
                                         submitted_interactively=submitted_interactively,
                                     )
-                                    res_approval_outcome = _approval_outcome(res)
-                                    res_no_file_path = isinstance(res, str) and any(
+                                    res_short_circuit = _short_circuit_reason(res)
+                                    res_no_file_path  = isinstance(res, str) and any(
                                         marker in res for marker in _RECOVERY_NOT_EXECUTED_MARKERS
                                     )
-                                    if res_approval_outcome or res_no_file_path:
-                                        if res_approval_outcome:
-                                            reason = f"approval_{res_approval_outcome}"
+                                    if res_short_circuit or res_no_file_path:
+                                        if res_short_circuit:
+                                            reason = res_short_circuit
                                             _log.info(
-                                                "Recovery via code_helper was not approved (%s; no live "
-                                                "player to confirm synchronously). Autonomous code-fix "
-                                                "recovery cannot complete in this context.",
-                                                res_approval_outcome, extra={"task_id": task_id},
+                                                "Recovery via code_helper did not complete (%s; no live "
+                                                "player to confirm synchronously, or it was rejected/timed "
+                                                "out). Autonomous code-fix recovery cannot complete in "
+                                                "this context.",
+                                                res_short_circuit, extra={"task_id": task_id},
                                             )
                                         else:
                                             reason = "missing_file_path"

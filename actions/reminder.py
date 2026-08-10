@@ -165,9 +165,11 @@ def _schedule_windows(target_dt: datetime, task_name: str,
 
     xml_path.write_text(xml_content, encoding="utf-16")
 
+    # 10s: schtasks validates the trigger/action XML — a touch heavier
+    # than a plain query/delete, but still a fast local scheduler call.
     result = subprocess.run(
         ["schtasks", "/Create", "/TN", task_name, "/XML", str(xml_path), "/F"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, timeout=10,
     )
 
     try:
@@ -220,9 +222,10 @@ def _schedule_mac(target_dt: datetime, task_name: str,
     plist_path.write_text(plist_content, encoding="utf-8")
     plist_path.chmod(0o644)
 
+    # 5s: fast local launchd IPC.
     result = subprocess.run(
         ["launchctl", "load", str(plist_path)],
-        capture_output=True, text=True,
+        capture_output=True, text=True, timeout=5,
     )
 
     if result.returncode != 0:
@@ -239,6 +242,8 @@ def _schedule_linux(target_dt: datetime, task_name: str,
 
     if shutil.which("systemd-run"):
         on_calendar = target_dt.strftime("%Y-%m-%d %H:%M:00")
+        # 10s: a D-Bus call to systemd to register a transient timer unit —
+        # slightly more involved than a plain query, still fast.
         result = subprocess.run(
             [
                 "systemd-run",
@@ -248,7 +253,7 @@ def _schedule_linux(target_dt: datetime, task_name: str,
                 "--",
                 sys.executable, str(script_path),
             ],
-            capture_output=True, text=True,
+            capture_output=True, text=True, timeout=10,
         )
         if result.returncode == 0:
             return task_name
@@ -257,9 +262,11 @@ def _schedule_linux(target_dt: datetime, task_name: str,
     if shutil.which("at"):
         at_time = target_dt.strftime("%H:%M %Y-%m-%d")
         cmd_str = f"{sys.executable} {script_path}\n"
+        # 10s: queues a one-off job with atd — fast, but less commonly
+        # exercised than cron/systemd-timer, a little extra headroom.
         result  = subprocess.run(
             ["at", at_time],
-            input=cmd_str, capture_output=True, text=True,
+            input=cmd_str, capture_output=True, text=True, timeout=10,
         )
         if result.returncode == 0:
             return task_name

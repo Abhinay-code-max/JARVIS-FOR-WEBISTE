@@ -8,6 +8,7 @@ import re
 
 from core.llm_client import call_llm_text
 from core.tool_dispatch import TOOL_DISPATCH
+from core.tool_declarations import build_planner_tool_reference
 from config import BASE_DIR
 
 _log = logging.getLogger("jarvis.planner")
@@ -20,7 +21,14 @@ _log = logging.getLogger("jarvis.planner")
 _VALID_TOOLS = set(TOOL_DISPATCH.keys())
 
 
-PLANNER_PROMPT = """You are the planning module of MARK XL, a personal AI assistant.
+# Generated from core/tool_declarations.py's TOOL_DECLARATIONS — the same
+# schema every tool call is validated against (core/tool_contracts.py) and
+# the same schema sent to the interactive LLM (main.py's OLLAMA_TOOLS) —
+# instead of being a third, separately hand-maintained copy. The previous
+# hand-written version had already drifted: it was missing file_processor,
+# daily_briefing, and vision_fix_code entirely, and had a stale action
+# list for code_helper (missing build/optimize/screen_debug).
+PLANNER_PROMPT = f"""You are the planning module of MARK XL, a personal AI assistant.
 Your job: break any user goal into a sequence of steps using ONLY the tools listed below.
 
 ABSOLUTE RULES:
@@ -32,104 +40,21 @@ ABSOLUTE RULES:
 
 AVAILABLE TOOLS AND THEIR PARAMETERS:
 
-open_app
-  app_name: string (required)
-
-web_search
-  query: string (required) — write a clear, focused search query
-  mode: "search" or "compare" (optional, default: search)
-  items: list of strings (optional, for compare mode)
-  aspect: string (optional, for compare mode)
-
-game_updater
-  action: "update" | "install" | "list" | "download_status" | "schedule" (required)
-  platform: "steam" | "epic" | "both" (optional, default: both)
-  game_name: string (optional)
-  app_id: string (optional)
-  shutdown_when_done: boolean (optional)
-
-browser_control
-  action: "go_to" | "search" | "click" | "type" | "scroll" | "get_text" | "press" | "close" (required)
-  url: string (for go_to)
-  query: string (for search)
-  text: string (for click/type)
-  direction: "up" | "down" (for scroll)
-
-file_controller
-  action: "write" | "create_file" | "read" | "list" | "delete" | "move" | "copy" | "find" | "disk_usage" (required)
-  path: string — use "desktop" for Desktop folder
-  name: string — filename
-  content: string — file content (for write/create_file)
-
-computer_settings
-  action: string (required)
-  description: string — natural language description
-  value: string (optional)
-
-computer_control
-  action: "type" | "click" | "hotkey" | "press" | "scroll" | "screenshot" | "screen_find" | "screen_click" (required)
-  text: string (for type)
-  x, y: int (for click)
-  keys: string (for hotkey, e.g. "ctrl+c")
-  key: string (for press)
-  direction: "up" | "down" (for scroll)
-  description: string (for screen_find/screen_click)
-
-screen_process
-  text: string (required) — what to analyze or ask about the screen
-  angle: "screen" | "camera" (optional)
-
-send_message
-  receiver: string (required)
-  message_text: string (required)
-  platform: string (required)
-
-reminder
-  date: string YYYY-MM-DD (required)
-  time: string HH:MM (required)
-  message: string (required)
-
-desktop_control
-  action: "wallpaper" | "organize" | "clean" | "list" | "task" (required)
-  path: string (optional)
-  task: string (optional)
-
-youtube_video
-  action: "play" | "summarize" | "trending" (required)
-  query: string (for play)
-
-weather_report
-  city: string (required)
-
-flight_finder
-  origin: string (required)
-  destination: string (required)
-  date: string (required)
-
-code_helper
-  action: "write" | "edit" | "run" | "explain" (required)
-  description: string (required)
-  language: string (optional)
-  output_path: string (optional)
-  file_path: string (optional)
-
-dev_agent
-  description: string (required)
-  language: string (optional)
+{build_planner_tool_reference(_VALID_TOOLS)}
 
 OUTPUT — return ONLY valid JSON, no markdown, no explanation, no code blocks:
-{
+{{
   "goal": "...",
   "steps": [
-    {
+    {{
       "step": 1,
       "tool": "tool_name",
       "description": "what this step does",
-      "parameters": {},
+      "parameters": {{}},
       "critical": true
-    }
+    }}
   ]
-}
+}}
 """
 
 

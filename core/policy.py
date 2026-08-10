@@ -62,6 +62,12 @@ DEFAULT_POLICY: list[tuple[str, str | None, str]] = [
     ("dev_agent",         None, ASK_AND_WAIT),  # delegated — core/tool_gate.DELEGATED_TOOLS
     ("vision_fix_code",   None, ASK_AND_WAIT),  # delegated — core/tool_gate.DELEGATED_TOOLS
     ("send_message",       None, ASK_AND_WAIT),
+    # Missed in the original permission-model pass — found while building
+    # per-tool contracts (core/tool_contracts.py) and cross-checking every
+    # TOOL_DISPATCH tool has a policy row. Writes a notify script to disk
+    # and registers a real OS-level scheduled task/cron/launchd job — same
+    # risk class as file_controller's write/create_file, not a read.
+    ("reminder", None, ASK_AND_WAIT),
 
     # ── ask-and-wait — action-specific overrides ────────────────────────────
     # file_controller: explicitly called out (write/delete/move/rename/
@@ -124,19 +130,39 @@ _seeded    = False
 
 
 def seed_default_policy() -> None:
-    """One-time seed, gated on a row-count check like the memory/contacts
-    migrations in core/db.py. Safe to call repeatedly."""
-    conn  = get_conn()
-    count = conn.execute("SELECT COUNT(*) FROM permission_policy").fetchone()[0]
-    if count > 0:
-        return
+    """Inserts any DEFAULT_POLICY row not already present — additive, not a
+    one-shot "only if the table is empty" gate. A row-count gate would mean
+    a tool added to DEFAULT_POLICY after a deployment's first run (like
+    'reminder', missed in the original pass and added later) would never
+    get seeded on existing installs, silently falling back to
+    get_policy_level()'s ask-and-wait default forever instead of the
+    intended row. Checked per-row rather than relying on a UNIQUE
+    constraint because SQLite doesn't dedupe NULL in (tool_name, action) —
+    see core/db.py's permission_policy comment. Table stays small (order
+    of DEFAULT_POLICY's length), so a SELECT per candidate row is cheap."""
+    conn = get_conn()
+    added = 0
     with conn:
         for tool_name, action, level in DEFAULT_POLICY:
+            if action is None:
+                exists = conn.execute(
+                    "SELECT 1 FROM permission_policy WHERE tool_name = ? AND action IS NULL",
+                    (tool_name,),
+                ).fetchone()
+            else:
+                exists = conn.execute(
+                    "SELECT 1 FROM permission_policy WHERE tool_name = ? AND action = ?",
+                    (tool_name, action),
+                ).fetchone()
+            if exists:
+                continue
             conn.execute(
                 "INSERT INTO permission_policy (tool_name, action, level) VALUES (?, ?, ?)",
                 (tool_name, action, level),
             )
-    _log.info("Seeded permission_policy with %d rows.", len(DEFAULT_POLICY))
+            added += 1
+    if added:
+        _log.info("Seeded %d new permission_policy row(s).", added)
 
 
 def _ensure_seeded() -> None:

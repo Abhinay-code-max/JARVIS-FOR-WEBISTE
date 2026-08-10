@@ -101,6 +101,7 @@ from core.tool_dispatch import TOOL_DISPATCH
 from core.tool_gate import dispatch_tool
 from core.confirm import CONFIRM
 from core.task_approval import TASK_APPROVAL
+from core.proactive import ProactiveLoop
 from config import load_config, BASE_DIR
 
 _log      = logging.getLogger("jarvis.main")
@@ -301,6 +302,12 @@ class JarvisXL:
         self._last_command_text:  str   = ""
         self._last_command_time:  float = 0.0
         self._dedup_window_sec:   float = 2.5
+
+        self._proactive = ProactiveLoop(
+            speak       = self.speak,
+            is_speaking = lambda: self._speaking,
+            is_muted    = lambda: self.ui.muted,
+        )
 
         self.ui.on_text_command = self._on_text_command
 
@@ -1062,6 +1069,7 @@ class JarvisXL:
 
             threading.Thread(target=self._tts_worker,       daemon=True).start()
             threading.Thread(target=self._text_command_loop, daemon=True).start()
+            threading.Thread(target=self._proactive.run,     daemon=True).start()
 
             if stt_engine == "deepgram":
                 self._listen_deepgram()

@@ -157,6 +157,23 @@ CREATE TABLE IF NOT EXISTS policy_decisions (
     created_at      REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_policy_decisions_task_id ON policy_decisions(task_id);
+
+-- Durable fire-once dedup for proactive nudges (core/proactive.py). Only
+-- needed for trigger types whose underlying row has no natural state-exit
+-- of its own: a failed task (tasks.status='failed') sits there forever,
+-- so without this an in-memory-only dedup set would re-surface every
+-- historical failure on the very next process restart. The stale-pending-
+-- approval trigger does NOT use this table — a pending approval always
+-- leaves 'pending' on its own, either resolved in-process or flipped to
+-- 'expired' by agent/task_queue.py's _reconcile_orphaned_approvals() on
+-- every startup, so an in-memory set already can't outlive its own
+-- relevance.
+CREATE TABLE IF NOT EXISTS proactive_nudges (
+    trigger_type TEXT NOT NULL,
+    ref_id       TEXT NOT NULL,
+    nudged_at    REAL NOT NULL,
+    PRIMARY KEY (trigger_type, ref_id)
+);
 """
 
 
@@ -456,3 +473,27 @@ def get_step_outcomes(task_id: str | None) -> list[dict]:
             current["detail"] = row["detail"] or ""
 
     return segments
+
+
+# ---------------------------------------------------------------------------
+# Proactive-nudge dedup (core/proactive.py) — see proactive_nudges schema
+# comment above for why only some trigger types need this.
+# ---------------------------------------------------------------------------
+
+def nudge_already_sent(trigger_type: str, ref_id: str) -> bool:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT 1 FROM proactive_nudges WHERE trigger_type = ? AND ref_id = ?",
+        (trigger_type, ref_id),
+    ).fetchone()
+    return row is not None
+
+
+def record_nudge(trigger_type: str, ref_id: str) -> None:
+    conn = get_conn()
+    with conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO proactive_nudges (trigger_type, ref_id, nudged_at) "
+            "VALUES (?, ?, ?)",
+            (trigger_type, ref_id, time.time()),
+        )

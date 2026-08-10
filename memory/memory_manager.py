@@ -18,11 +18,43 @@ MEMORY_PATH = BASE_DIR / "memory" / "long_term.json"
 MAX_VALUE_LENGTH = 380
 MEMORY_MAX_CHARS = 8000
 
-# Every row in this phase uses the 'default' store — see memory_entries'
-# schema comment in core/db.py for why the column exists anyway.
-_STORE = "default"
+# Backstop only, not a realistic budget — profile entries are a handful of
+# near-permanent identity/relationship facts (name, city, a few family
+# members), nowhere near this in normal use. It exists so a pathological
+# case still has *some* bound rather than truly unbounded growth, not
+# because we expect it to ever fire.
+PROFILE_MAX_CHARS = 4000
 
 _CATEGORIES = ("identity", "preferences", "projects", "relationships", "wishes", "notes")
+
+# Two stores, not one, as of the memory-layers phase — see
+# core/db.py's memory_entries schema comment and
+# core/db.py's _migrate_profile_categories for the one-time migration.
+#
+# 'profile' (identity, relationships): low-write-frequency, high-value,
+# near-permanent facts — exempt from the normal shared eviction budget.
+# Investigation finding this fixes: eviction is oldest-updated_at-first
+# with no category awareness, so a user's name (saved once, rarely
+# re-touched) could have an older updated_at than a throwaway note added
+# last week, and would legitimately be the first thing eviction picks —
+# a real, structurally-possible failure mode under the old flat table,
+# not a hypothetical one.
+#
+# 'default' (preferences, projects, wishes, notes): unchanged behavior
+# from before this phase — same MEMORY_MAX_CHARS budget, same
+# oldest-updated_at-first eviction. These are the genuinely more
+# disposable/time-bound categories; none of the four has a stronger
+# retention claim than the others, so they continue sharing one budget.
+_PROFILE_STORE      = "profile"
+_DEFAULT_STORE      = "default"
+_PROFILE_CATEGORIES = ("identity", "relationships")
+
+
+def _store_for_category(category: str) -> str:
+    """Categories outside the current 6 (see _rows_to_memory's own
+    tolerance for this) default to 'default', not 'profile' — an unknown
+    category has no established claim to protected retention."""
+    return _PROFILE_STORE if category in _PROFILE_CATEGORIES else _DEFAULT_STORE
 
 
 def _empty_memory() -> dict:
@@ -42,9 +74,14 @@ def _rows_to_memory(rows) -> dict:
 
 
 def _load_memory_on(conn) -> dict:
+    """Merges both stores into the one nested dict shape every existing
+    caller already expects — the store split is entirely internal to this
+    module; load_memory()'s return shape and every consumer of it
+    (format_memory_for_prompt, computer_control.py's _user_profile,
+    daily_briefing.py's _get_user_city) are unchanged by this phase."""
     rows = conn.execute(
-        "SELECT category, key, value, updated_at FROM memory_entries WHERE store = ?",
-        (_STORE,),
+        "SELECT category, key, value, updated_at FROM memory_entries WHERE store IN (?, ?)",
+        (_PROFILE_STORE, _DEFAULT_STORE),
     ).fetchall()
     return _rows_to_memory(rows)
 
@@ -68,43 +105,62 @@ def _upsert_entries(conn, memory: dict) -> None:
     for cat, key, entry in _all_entries(memory):
         value   = entry.get("value", "")
         updated = entry.get("updated") or datetime.now().strftime("%Y-%m-%d")
+        store   = _store_for_category(cat)
         conn.execute(
             "INSERT INTO memory_entries (store, category, key, value, updated_at) "
             "VALUES (?, ?, ?, ?, ?) "
             "ON CONFLICT(store, category, key) DO UPDATE SET "
             "value = excluded.value, updated_at = excluded.updated_at",
-            (_STORE, cat, key, value, updated),
+            (store, cat, key, value, updated),
         )
 
 
-def _evict_over_budget(conn) -> list[tuple[str, str]]:
-    """Delete oldest-updated_at rows until SUM(LENGTH(value)) across all
-    'default'-store rows is back under MEMORY_MAX_CHARS. Must be called
-    from within the caller's own transaction (it does not commit)."""
+def _evict_over_budget(conn, store: str, budget: int) -> list[tuple[str, str]]:
+    """Delete oldest-updated_at rows *within `store` only* until
+    SUM(LENGTH(value)) for that store is back under `budget`. Must be
+    called from within the caller's own transaction (it does not commit).
+
+    Per-store, not global, as of the memory-layers phase: a write that
+    pushes 'default' over budget can never delete a 'profile' row, and
+    vice versa — see this module's _PROFILE_CATEGORIES comment for why
+    that separation exists (a shared budget let a low-value 'notes' entry
+    evict a high-value 'identity' entry purely because eviction is
+    oldest-updated_at-first with no category awareness)."""
     total = conn.execute(
         "SELECT COALESCE(SUM(LENGTH(value)), 0) FROM memory_entries WHERE store = ?",
-        (_STORE,),
+        (store,),
     ).fetchone()[0]
-    if total <= MEMORY_MAX_CHARS:
+    if total <= budget:
         return []
 
     rows = conn.execute(
         "SELECT category, key, LENGTH(value) AS vlen FROM memory_entries "
         "WHERE store = ? ORDER BY updated_at ASC",
-        (_STORE,),
+        (store,),
     ).fetchall()
 
     evicted = []
     for row in rows:
-        if total <= MEMORY_MAX_CHARS:
+        if total <= budget:
             break
         conn.execute(
             "DELETE FROM memory_entries WHERE store = ? AND category = ? AND key = ?",
-            (_STORE, row["category"], row["key"]),
+            (store, row["category"], row["key"]),
         )
         total -= row["vlen"]
         evicted.append((row["category"], row["key"]))
-        _log.info("Trimmed %s/%s", row['category'], row['key'])
+        _log.info("Trimmed %s/%s (store=%s)", row['category'], row['key'], store)
+    return evicted
+
+
+def _evict_all_stores(conn) -> list[tuple[str, str]]:
+    """Runs eviction independently per store, both with their own budget,
+    after every write — regardless of which store the write actually
+    touched. Simpler and cheap (row counts are small) compared to tracking
+    exactly which store(s) a given update_memory() call could have
+    affected."""
+    evicted = _evict_over_budget(conn, _DEFAULT_STORE, MEMORY_MAX_CHARS)
+    evicted += _evict_over_budget(conn, _PROFILE_STORE, PROFILE_MAX_CHARS)
     return evicted
 
 
@@ -115,7 +171,7 @@ def save_memory(memory: dict) -> list[tuple[str, str]]:
     conn.execute("BEGIN IMMEDIATE")
     try:
         _upsert_entries(conn, memory)
-        evicted = _evict_over_budget(conn)
+        evicted = _evict_all_stores(conn)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -168,7 +224,7 @@ def update_memory(memory_update: dict) -> dict:
         memory = _load_memory_on(conn)
         if _recursive_update(memory, memory_update):
             _upsert_entries(conn, memory)
-            evicted = _evict_over_budget(conn)
+            evicted = _evict_all_stores(conn)
             msg = f"Saved: {list(memory_update.keys())}"
             if evicted:
                 forgotten = ", ".join(f"{cat}/{key}" for cat, key in evicted)
@@ -267,12 +323,13 @@ def remember(key: str, value: str, category: str = "notes") -> str:
 
 
 def forget(key: str, category: str = "notes") -> str:
-    conn = get_conn()
+    conn  = get_conn()
+    store = _store_for_category(category)
     conn.execute("BEGIN IMMEDIATE")
     try:
         row = conn.execute(
             "SELECT 1 FROM memory_entries WHERE store = ? AND category = ? AND key = ?",
-            (_STORE, category, key),
+            (store, category, key),
         ).fetchone()
         if not row:
             conn.rollback()
@@ -280,9 +337,9 @@ def forget(key: str, category: str = "notes") -> str:
 
         conn.execute(
             "DELETE FROM memory_entries WHERE store = ? AND category = ? AND key = ?",
-            (_STORE, category, key),
+            (store, category, key),
         )
-        evicted = _evict_over_budget(conn)   # deletion alone can't overflow; kept for parity with the original save_memory-after-forget behavior
+        evicted = _evict_all_stores(conn)   # deletion alone can't overflow; kept for parity with the original save_memory-after-forget behavior
         conn.commit()
     except Exception:
         conn.rollback()

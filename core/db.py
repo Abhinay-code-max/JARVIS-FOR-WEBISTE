@@ -76,9 +76,18 @@ CREATE TABLE IF NOT EXISTS log_events (
 CREATE INDEX IF NOT EXISTS idx_log_events_task_id    ON log_events(task_id);
 CREATE INDEX IF NOT EXISTS idx_log_events_created_at ON log_events(created_at);
 
--- `store` defaults to 'default' and every row uses that value in this
--- phase — column exists so a later split into multiple typed memory
--- stores has somewhere to land without a schema migration.
+-- Two stores as of the memory-layers phase (see memory_manager.py's
+-- _store_for_category and _migrate_profile_categories below):
+-- 'profile' (identity, relationships) — low-write-frequency, high-value,
+-- near-permanent facts, exempt from the normal shared eviction budget
+-- (its own separate, generous backstop cap instead — see
+-- memory_manager.PROFILE_MAX_CHARS). 'default' (preferences, projects,
+-- wishes, notes) — everything else, unchanged behavior from before this
+-- phase (memory_manager.MEMORY_MAX_CHARS, oldest-updated_at-first
+-- eviction). The `store` column predates the actual split — it was added
+-- during the persistence phase specifically so this later split would
+-- have somewhere to land without a schema migration; this phase is that
+-- split.
 CREATE TABLE IF NOT EXISTS memory_entries (
     store       TEXT NOT NULL DEFAULT 'default',
     category    TEXT NOT NULL,
@@ -175,6 +184,7 @@ def get_conn() -> sqlite3.Connection:
 
     _migrate_legacy_memory(conn)
     _migrate_legacy_contacts(conn)
+    _migrate_profile_categories(conn)
 
     return conn
 
@@ -280,6 +290,47 @@ def _migrate_legacy_contacts(conn: sqlite3.Connection) -> None:
                 (alias, exact_name),
             )
     _log.info("Migrated %d contact(s) from %s.", len(raw), contacts_path.name)
+
+
+def _migrate_profile_categories(conn: sqlite3.Connection) -> None:
+    """One-time reclassification of identity/relationships rows from the
+    flat 'default' store into the dedicated 'profile' store (the
+    memory-layers phase — see memory_manager.py's _store_for_category and
+    the schema comment on memory_entries below). A plain UPDATE, not a
+    delete+reinsert — no data loss, no row ever leaves memory_entries.
+
+    Must run after _migrate_legacy_memory/_migrate_legacy_contacts above:
+    a fresh install importing memory/long_term.json lands everything in
+    'default' first (that migration predates the store split and knows
+    nothing about it), so this pass is what actually reclassifies those
+    rows afterward.
+
+    Idempotent: skips once any 'profile'-store row exists — covers both
+    "already migrated" and "nothing to migrate" (a fresh DB with no memory
+    data at all, or one that already has profile rows because
+    memory_manager.py's own writes have gone straight to the right store
+    since this phase landed)."""
+    row_count = conn.execute(
+        "SELECT COUNT(*) FROM memory_entries WHERE store = 'profile'"
+    ).fetchone()[0]
+    if row_count > 0:
+        return
+
+    # Imported lazily — same reason _migrate_legacy_memory imports from
+    # memory_manager lazily: memory_manager imports get_conn from this
+    # module, so a module-level import here would be circular.
+    from memory.memory_manager import _PROFILE_CATEGORIES
+
+    placeholders = ", ".join("?" * len(_PROFILE_CATEGORIES))
+    with conn:
+        cur = conn.execute(
+            f"UPDATE memory_entries SET store = 'profile' "
+            f"WHERE store = 'default' AND category IN ({placeholders})",
+            _PROFILE_CATEGORIES,
+        )
+        n = cur.rowcount
+    if n:
+        _log.info("Migrated %d memory_entries row(s) from 'default' to 'profile' store.", n)
 
 
 # ---------------------------------------------------------------------------

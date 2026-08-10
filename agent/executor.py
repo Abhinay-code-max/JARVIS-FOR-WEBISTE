@@ -14,14 +14,15 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from agent.planner       import create_plan, replan
-from agent.error_handler import analyze_error, generate_fix, ErrorDecision
-from core.llm_client     import call_llm_text
-from core.tool_dispatch  import TOOL_DISPATCH
-from core.tool_gate      import dispatch_tool
-from core.tool_contracts import get_contract
-from core.db             import log_task_event
-from config              import BASE_DIR
+from agent.planner          import create_plan, replan
+from agent.error_handler    import analyze_error, generate_fix, ErrorDecision
+from agent.step_references  import resolve_references, UnresolvedReferenceError
+from core.llm_client        import call_llm_text
+from core.tool_dispatch     import TOOL_DISPATCH
+from core.tool_gate         import dispatch_tool
+from core.tool_contracts    import get_contract
+from core.db                import log_task_event
+from config                 import BASE_DIR
 
 _log = logging.getLogger("jarvis.executor")
 
@@ -216,19 +217,26 @@ def _approval_outcome(result) -> str | None:
 
 
 def _short_circuit_reason(result) -> str | None:
-    """Classifies a dispatch_tool() string result that must fail the step
-    immediately — never retried, never routed through analyze_error's
-    RETRY branch — because retrying wouldn't help (a bad permission
-    decision or invalid parameters won't change on a blind re-run) or
-    could be actively harmful: an execution-timeout's underlying call was
-    *abandoned*, not cancelled (see core/tool_gate.py's
-    _invoke_with_timeout) — its daemon thread may still be running, so an
-    immediate retry risks a second concurrent execution of a tool that was
-    deemed non-idempotent enough to time-box in the first place.
+    """Classifies a string result that must fail the step immediately —
+    never retried, never routed through analyze_error's RETRY branch —
+    because retrying wouldn't help (a bad permission decision, invalid
+    parameters, or a ${step_N.output} reference that has nothing to
+    resolve to won't change on a blind re-run) or could be actively
+    harmful: an execution-timeout's underlying call was *abandoned*, not
+    cancelled (see core/tool_gate.py's _invoke_with_timeout) — its daemon
+    thread may still be running, so an immediate retry risks a second
+    concurrent execution of a tool that was deemed non-idempotent enough
+    to time-box in the first place.
 
     Returns a short reason tag ('approval_timeout' | 'approval_denied' |
-    'validation_failed' | 'execution_timeout') or None if `result` is an
-    ordinary tool result that should proceed normally."""
+    'validation_failed' | 'execution_timeout' | 'unresolved_reference') or
+    None if `result` is an ordinary tool result that should proceed
+    normally. 'unresolved_reference' is defense in depth, not the expected
+    path — agent/planner.py's _validate_and_fix_plan already rejects any
+    self/forward/nonexistent step reference before a plan is ever handed
+    to the executor; the only way this fires in practice is a referenced
+    step being legitimately skipped at runtime, which can't be caught at
+    plan-creation time."""
     outcome = _approval_outcome(result)
     if outcome:
         return f"approval_{outcome}"
@@ -237,6 +245,8 @@ def _short_circuit_reason(result) -> str | None:
             return "validation_failed"
         if "did not complete within" in result and "was abandoned" in result:
             return "execution_timeout"
+        if result.startswith("Unresolved — "):
+            return "unresolved_reference"
     return None
 
 
@@ -305,7 +315,6 @@ class AgentExecutor:
 
         replan_attempts = 0
         completed_steps: list = []
-        step_results:    dict = {}
         plan = create_plan(goal, task_id=task_id)
 
         while True:
@@ -314,6 +323,17 @@ class AgentExecutor:
                 msg = "I couldn't create a valid plan for this task, sir."
                 if speak: speak(msg)
                 return msg
+
+            # Fresh per plan/replan attempt, not just once outside this
+            # loop: replan() re-numbers steps from 1 again in the revised
+            # plan, which has no defined relationship to the previous
+            # (superseded) plan's numbering. Carrying old entries forward
+            # would let a stale step_results[1] from a discarded attempt
+            # silently resolve into an unrelated step's ${step_1.output}
+            # reference in the new plan. completed_steps is NOT reset
+            # here — replan()'s prompt uses it to tell the LLM what's
+            # already done so it doesn't repeat those steps.
+            step_results: dict = {}
 
             success      = True
             failed_step  = None
@@ -330,11 +350,39 @@ class AgentExecutor:
                 params   = step.get("parameters", {})
                 params   = _inject_context(params, tool, step_results, goal=goal, task_id=task_id, step_num=step_num)
 
-                log_task_event(task_id, step_num, tool, desc, "started")
                 step_start = time.monotonic()
+                attempt    = 1
+                step_ok    = False
 
-                attempt = 1
-                step_ok = False
+                # ${step_N.output} substitution — resolved once here, before
+                # "started" is even logged and before _call_tool()/
+                # dispatch_tool()'s input validation runs, so validation
+                # checks the actual resulting value rather than the literal
+                # "${step_N.output}" template text. Not inside the retry
+                # loop below: step_results can't change mid-retry (no other
+                # step runs concurrently), so re-resolving on every attempt
+                # would be redundant — and a resolution failure is never
+                # retryable in the first place (see _short_circuit_reason).
+                try:
+                    params = resolve_references(params, step_results)
+                except UnresolvedReferenceError as ref_err:
+                    result = (
+                        f"Unresolved — step {step_num} references step "
+                        f"{ref_err.step_num}'s output, which is not "
+                        f"available (skipped, failed, or never ran)."
+                    )
+                    short_circuit = _short_circuit_reason(result)
+                    detail = f"{short_circuit}: {result}"
+                    log_task_event(
+                        task_id, step_num, tool, desc, "failed", detail,
+                        duration_ms=int((time.monotonic() - step_start) * 1000),
+                    )
+                    failed_step  = step
+                    failed_error = detail
+                    success      = False
+                    break
+
+                log_task_event(task_id, step_num, tool, desc, "started")
 
                 while attempt <= 3:
                     if cancel_flag and cancel_flag.is_set():

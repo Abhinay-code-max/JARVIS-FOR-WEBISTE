@@ -186,6 +186,7 @@ class PostconditionRegistryTest(unittest.TestCase):
         approved = {
             "file_controller", "file_processor", "code_helper",
             "dev_agent", "reminder", "game_updater", "desktop_control",
+            "computer_control",
         }
         self.assertEqual(set(postconditions.POSTCONDITION_CHECKS.keys()), approved)
 

@@ -299,18 +299,36 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "computer_control",
-        "description": "Direct mouse/keyboard control: click, type, scroll, hotkeys.",
+        "description": (
+            "Direct mouse/keyboard control: click, type, scroll, hotkeys, drag. "
+            "For any UI element you can describe (a button, icon, menu item, "
+            "link, field) but don't have exact pixel coordinates for, prefer "
+            "action='screen_click' with a 'description' of the element over "
+            "guessing x/y — it locates the element on screen via a vision model "
+            "and clicks it directly. action='screen_find' does the same lookup "
+            "without clicking, returning 'x,y' or 'NOT_FOUND'. Reserve raw x/y "
+            "for precise or relative positioning (e.g. a small mouse nudge, or "
+            "coordinates already confirmed by an earlier screen_find step)."
+        ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":      {"type": "STRING"},
-                "text":        {"type": "STRING"},
-                "x":           {"type": "INTEGER"},
-                "y":           {"type": "INTEGER"},
-                "keys":        {"type": "STRING"},
+                "action":      {"type": "STRING", "description": "click, double_click, right_click, type, smart_type, move, drag, hotkey, press, scroll, copy, paste, screenshot, wait, clear_field, focus_window, screen_find, screen_click, random_data, user_data"},
+                "text":        {"type": "STRING", "description": "text to type or paste"},
+                "x":           {"type": "INTEGER", "description": "screen x coordinate"},
+                "y":           {"type": "INTEGER", "description": "screen y coordinate"},
+                "x1":          {"type": "INTEGER", "description": "drag: start x coordinate"},
+                "y1":          {"type": "INTEGER", "description": "drag: start y coordinate"},
+                "x2":          {"type": "INTEGER", "description": "drag: end x coordinate"},
+                "y2":          {"type": "INTEGER", "description": "drag: end y coordinate"},
+                "button":      {"type": "STRING", "description": "'left' or 'right' — optional override for the 'click' action (default left)"},
+                "clicks":      {"type": "INTEGER", "description": "click count — optional override for the 'click' action (default 1)"},
+                "keys":        {"type": "STRING", "description": "hotkey combination, e.g. 'ctrl+c'"},
                 "direction":   {"type": "STRING"},
                 "amount":      {"type": "INTEGER"},
                 "seconds":     {"type": "NUMBER"},
+                "title":       {"type": "STRING", "description": "window title fragment, for focus_window"},
+                "description": {"type": "STRING", "description": "natural-language description of the UI element to find/click, for screen_find/screen_click — e.g. 'the File menu', 'the red close button'"},
             },
             "required": ["action"]
         }

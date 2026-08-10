@@ -331,7 +331,11 @@ def computer_control(
       action        : (required) one of the actions listed below
       text          : text to type or paste
       x, y          : screen coordinates
-      button        : 'left' | 'right' (default: left)
+      x1,y1,x2,y2   : drag start/end coordinates
+      button        : 'left' | 'right' (default: left) — applies to the
+                      generic 'click'/'left_click' action; double_click/
+                      right_click are their own explicit actions instead
+      clicks        : click count override for 'click'/'left_click' (default: 1)
       keys          : hotkey string, e.g. 'ctrl+c'
       key           : single key name, e.g. 'enter'
       direction     : 'up' | 'down' | 'left' | 'right'
@@ -389,7 +393,10 @@ def computer_control(
             )
 
         if action in ("click", "left_click"):
-            return _click(params.get("x"), params.get("y"), "left", 1)
+            return _click(
+                params.get("x"), params.get("y"),
+                params.get("button", "left"), int(params.get("clicks", 1)),
+            )
 
         if action == "double_click":
             return _click(params.get("x"), params.get("y"), "left", 2)

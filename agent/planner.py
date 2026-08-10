@@ -47,6 +47,28 @@ ABSOLUTE RULES:
 - Use web_search for ANY information retrieval, research, or current data.
 - Use file_controller to save content to disk.
 - Max 5 steps. Use the minimum steps needed.
+- For computer_control actions that target a specific UI element (a button,
+  icon, menu item, link, field) that you can describe in words, prefer
+  action="screen_click" with a "description" of the element over guessing
+  raw x/y coordinates — screen_click locates the element visually and
+  clicks it, which is far more reliable than a guessed pixel position.
+  Only use raw x/y for precise or relative positioning you already know
+  (e.g. a small mouse nudge, or coordinates an earlier screen_find step
+  already returned).
+- Use screen_process to check what's currently on screen mid-plan (e.g.
+  confirm a window actually opened, or a dialog appeared) when a later
+  step's success depends on an earlier step's uncertain outcome.
+
+EXAMPLE — opening an app and clicking a described element instead of
+guessing coordinates:
+  {{"step": 1, "tool": "open_app", "parameters": {{"app_name": "notepad"}}}}
+  {{"step": 2, "tool": "computer_control", "parameters": {{"action": "screen_click", "description": "the File menu"}}}}
+
+EXAMPLE — a short GUI chain, typing into a described field after opening
+the app:
+  {{"step": 1, "tool": "open_app", "parameters": {{"app_name": "notepad"}}}}
+  {{"step": 2, "tool": "computer_control", "parameters": {{"action": "screen_click", "description": "the main text editing area"}}}}
+  {{"step": 3, "tool": "computer_control", "parameters": {{"action": "type", "text": "Hello, world!"}}}}
 
 AVAILABLE TOOLS AND THEIR PARAMETERS:
 

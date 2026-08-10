@@ -62,6 +62,63 @@ def _extract_action(tool: str, args: dict) -> str | None:
     return extractor(args) if extractor else None
 
 
+def _computer_control_detail(args: dict) -> str | None:
+    """computer_control's action names alone don't say *what* will be
+    clicked/typed/dragged — unlike e.g. file_controller's extracted action
+    string, which already names the target file. That's fine for policy
+    lookup (ACTION_EXTRACTORS only needs the action name), but a human
+    approving an ask-and-wait request — especially a background task's,
+    answered out-of-band via approve_task with no other context — deserves
+    to see the actual target, not just the word 'click'."""
+    action = (args.get("action") or "").strip().lower()
+
+    if action in ("screen_find", "screen_click"):
+        desc = args.get("description")
+        return f"target: {desc}" if desc else None
+
+    if action in ("type", "smart_type", "paste"):
+        text = args.get("text", "")
+        if not text:
+            return None
+        snippet = text[:60] + ("…" if len(text) > 60 else "")
+        return f"text: {snippet!r}"
+
+    if action in ("click", "left_click", "double_click", "right_click", "move"):
+        x, y = args.get("x"), args.get("y")
+        return f"at ({x}, {y})" if x is not None and y is not None else None
+
+    if action == "drag":
+        return f"from ({args.get('x1')}, {args.get('y1')}) to ({args.get('x2')}, {args.get('y2')})"
+
+    if action == "hotkey":
+        keys = args.get("keys")
+        return f"keys: {keys}" if keys else None
+
+    if action == "press":
+        key = args.get("key")
+        return f"key: {key}" if key else None
+
+    if action == "focus_window":
+        title = args.get("title")
+        return f"window: {title}" if title else None
+
+    return None
+
+
+# Per-tool detail extractor: raw dispatch args -> a short human-readable
+# description of what the call will actually do, appended to the
+# ask-and-wait prompt. Only computer_control has one today — see
+# _computer_control_detail's docstring for why it specifically needs one.
+DETAIL_EXTRACTORS = {
+    "computer_control": _computer_control_detail,
+}
+
+
+def _extract_detail(tool: str, args: dict) -> str | None:
+    extractor = DETAIL_EXTRACTORS.get(tool)
+    return extractor(args) if extractor else None
+
+
 def _log_decision(tool: str, action: str | None, level: str, outcome: str, task_id: str | None) -> None:
     try:
         conn = get_conn()
@@ -285,7 +342,13 @@ def dispatch_tool(
 
     else:
         assert level == ASK_AND_WAIT
-        prompt = f"I'm about to run {tool}" + (f" — {action}" if action else "") + "."
+        detail = _extract_detail(tool, args)
+        prompt = (
+            f"I'm about to run {tool}"
+            + (f" — {action}" if action else "")
+            + (f" ({detail})" if detail else "")
+            + "."
+        )
 
         if player is not None:
             approved = CONFIRM.request(player, prompt, speak=speak)

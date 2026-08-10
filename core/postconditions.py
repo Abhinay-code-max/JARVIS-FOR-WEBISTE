@@ -333,17 +333,91 @@ def _check_desktop_control(args: dict, result: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# computer_control — screen_click only. Re-screenshots after a short settle
+# delay and asks the vision model an independent outcome question derived
+# from the click's own `description` — "does the screen now look like X
+# happened" — rather than re-confirming the original locate call's (x, y)
+# guess with the same fallible process that produced it in the first place.
+# That distinction is exactly why this is scoped to screen_click alone: it's
+# the one computer_control action whose arguments carry a natural-language
+# claim about the *end state* it should produce, which is genuinely
+# checkable independently of how the click was targeted. Raw click/type/
+# hotkey/drag/press have no such derivable claim from their arguments alone
+# (click(500, 300) has no "expected outcome" to ask a vision model about)
+# and stay deliberately unchecked — this was the same reasoning that
+# excluded computer_control entirely in the earlier verification phase; a
+# vision-based outcome check for screen_click doesn't share the rejected
+# "self-verification" shape, but nothing else about that exclusion changes.
+# ---------------------------------------------------------------------------
+
+_SCREEN_CLICK_SETTLE_SECONDS = 0.6
+
+
+def _check_computer_control(args: dict, result: str) -> str | None:
+    action = (args.get("action") or "").strip().lower()
+    if action != "screen_click":
+        return None  # every other action has no independently-checkable claim
+
+    description = (args.get("description") or "").strip()
+    if not description or result.startswith("Element not found"):
+        return None  # nothing was clicked — the tool's own result already says so
+
+    try:
+        import pyautogui
+    except ImportError:
+        return None  # can't verify without a screenshot backend — no opinion
+
+    import time as _time
+    import io as _io
+    from config import load_config as _load_config
+    from core.llm_client import call_llm_vision as _llm_vision
+
+    _time.sleep(_SCREEN_CLICK_SETTLE_SECONDS)
+
+    try:
+        cfg          = _load_config()
+        vision_model = cfg.get("vision_model") or cfg.get("llm_model", "llava")
+        img          = pyautogui.screenshot()
+        buf          = _io.BytesIO()
+        img.save(buf, format="PNG")
+
+        prompt = (
+            f"A user just tried to click on '{description}' on this screen. "
+            f"Looking at this CURRENT screenshot, does it look like that "
+            f"click succeeded — i.e. does the screen now show the effect of "
+            f"interacting with '{description}' (it opened, activated, "
+            f"changed state, highlighted, navigated, etc.)? "
+            f"Reply with ONLY one word: YES, NO, or UNCLEAR if you cannot "
+            f"tell from this screenshot alone."
+        )
+        # timeout=60 matches every other vision call site in this codebase
+        # (screen_processor.py, vision_fix_code.py) — a shorter value was
+        # tried first and observed to time out on a cold model load (the
+        # vision model not yet resident in Ollama), producing a spurious
+        # "couldn't verify" instead of a real answer.
+        answer = _llm_vision(prompt, buf.getvalue(), model=vision_model, timeout=60).strip().upper()
+    except Exception as e:
+        _log.warning("computer_control postcondition check couldn't run: %s", e)
+        return None  # couldn't verify -> no opinion, never a false failure
+
+    if answer.startswith("NO"):
+        return f"screen_click on '{description}' does not appear to have taken effect (vision check: NO)."
+    return None  # YES, UNCLEAR, or an unparsed response -> no opinion, not a failure
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
 POSTCONDITION_CHECKS = {
-    "file_controller": _check_file_controller,
-    "file_processor":  _check_file_processor,
-    "code_helper":     _check_code_helper,
-    "dev_agent":       _check_dev_agent,
-    "reminder":        _check_reminder,
-    "game_updater":    _check_game_updater,
-    "desktop_control": _check_desktop_control,
+    "file_controller":  _check_file_controller,
+    "file_processor":   _check_file_processor,
+    "code_helper":      _check_code_helper,
+    "dev_agent":        _check_dev_agent,
+    "reminder":         _check_reminder,
+    "game_updater":     _check_game_updater,
+    "desktop_control":  _check_desktop_control,
+    "computer_control": _check_computer_control,
 }
 
 

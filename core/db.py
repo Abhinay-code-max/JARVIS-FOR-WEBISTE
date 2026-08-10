@@ -396,3 +396,63 @@ def get_task_trace(task_id: str) -> list[sqlite3.Row]:
         "ORDER BY created_at",
         (task_id, task_id),
     ).fetchall()
+
+
+_TERMINAL_STEP_STATUSES = ("done", "skipped", "failed")
+
+
+def get_step_outcomes(task_id: str | None) -> list[dict]:
+    """One entry per step *attempt segment* for a task — the accurate,
+    durable source _summarize() reads from (agent/executor.py) instead of
+    re-deriving a narrative from step descriptions alone, which can't
+    distinguish a step that actually ran from one that was skipped.
+
+    A step_num can legitimately appear more than once across a task: a
+    replan re-numbers its revised plan from 1 again, with no relationship
+    to the superseded plan's numbering, so step_num 2 in one attempt and
+    step_num 2 in the next may be entirely unrelated steps. Each 'started'
+    event begins a new segment for that step_num, so reused numbers are
+    never conflated across plan attempts — this mirrors the same
+    per-replan-attempt reset agent/executor.py already applies to its own
+    in-memory step_results dict, just on the durable log instead.
+
+    Within a segment, 'attempt_failed'/'retried'/'replanned' rows are
+    transient noise (see log_task_event's status vocabulary docstring);
+    each entry's status is the LAST terminal status seen ('done' |
+    'skipped' | 'failed'), or 'unknown' if a segment never reached one
+    (task cancelled or interrupted mid-step).
+
+    Returns [] for a falsy task_id (nothing would have been logged
+    anyway — matches log_task_event's own no-op convention) rather than
+    querying with a bound NULL."""
+    if not task_id:
+        return []
+
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT step_num, tool, description, status, detail FROM task_events "
+        "WHERE task_id = ? AND step_num IS NOT NULL ORDER BY event_id ASC",
+        (task_id,),
+    ).fetchall()
+
+    segments: list[dict] = []
+    current: dict | None = None
+
+    for row in rows:
+        if row["status"] == "started" or current is None or row["step_num"] != current["step_num"]:
+            current = {
+                "step_num":    row["step_num"],
+                "tool":        row["tool"],
+                "description": row["description"],
+                "status":      "unknown",
+                "detail":      "",
+            }
+            segments.append(current)
+            if row["status"] == "started":
+                continue
+
+        if row["status"] in _TERMINAL_STEP_STATUSES:
+            current["status"] = row["status"]
+            current["detail"] = row["detail"] or ""
+
+    return segments

@@ -35,6 +35,7 @@ from core.tool_contracts   import get_contract, ToolContract
 from core.confirm          import CONFIRM
 from core.policy           import get_policy_level, ACTION_EXTRACTORS, ASK_AND_WAIT, HARD_DENY, AUTO_ALLOW, NOTIFY_ONLY
 from core.task_approval    import TASK_APPROVAL
+from core.postconditions   import check_postcondition
 from core.db                import get_conn
 
 _log = logging.getLogger("jarvis.tool_gate")
@@ -201,6 +202,27 @@ def _invoke_with_timeout(tool: str, args: dict, player, speak, contract: ToolCon
 
 
 # ---------------------------------------------------------------------------
+# Postcondition check
+# ---------------------------------------------------------------------------
+
+def _apply_postcondition(tool: str, args: dict, result: str) -> str:
+    """Runs the postcondition check registered for `tool` (if any — see
+    core/postconditions.py, most tools have none) and, on failure,
+    returns a distinguishable synthetic string instead of the tool's own
+    result — never raises here. Every dispatch_tool() failure path
+    returns a string, matching validation/permission/timeout's own
+    convention; deciding whether a postcondition failure should be
+    re-raised as an exception and routed through analyze_error() is a
+    retry-policy question, which belongs in agent/executor.py where
+    retry decisions are actually made, not in this module."""
+    unmet = check_postcondition(tool, args, result)
+    if unmet is None:
+        return result
+    _log.warning("Postcondition unmet for '%s': %s", tool, unmet)
+    return f"Postcondition unmet — '{tool}' {unmet} (tool reported: {result[:200]!r})"
+
+
+# ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 
@@ -214,8 +236,18 @@ def dispatch_tool(
 ) -> str:
     """Validates input, evaluates permission_policy for (tool, action),
     gates as needed, then calls TOOL_DISPATCH[tool] under its contract's
-    timeout. Never call this from the audio/transcript thread — same rule
-    as CONFIRM.request()."""
+    timeout and checks its postcondition (if one is registered — see
+    core/postconditions.py). Never call this from the audio/transcript
+    thread — same rule as CONFIRM.request().
+
+    Every path that actually invokes the tool (delegated, auto-allow,
+    notify-only, ask-and-wait-approved) funnels through the single
+    "invoke, then check" tail near the end — nothing after the branching
+    below returns early once invocation has been decided, so the
+    postcondition check always runs regardless of which permission level
+    or gate path got us here, instead of being duplicated at each of the
+    4 call sites that used to each return _invoke_with_timeout(...)
+    directly."""
     if tool not in TOOL_DISPATCH:
         raise ValueError(
             f"Unknown tool '{tool}' — no such tool exists. "
@@ -231,47 +263,58 @@ def dispatch_tool(
         _log_decision(tool, action, level, "rejected", task_id)
         return f"Rejected — '{tool}' parameters are invalid: {validation_error}"
 
+    should_invoke = True
+    notify_after  = False
+    early_result  = None
+    outcome       = None
+
     if tool in DELEGATED_TOOLS:
-        _log_decision(tool, action, level, "delegated", task_id)
-        return _invoke_with_timeout(tool, args, player, speak, contract)
+        outcome = "delegated"
 
-    if level == HARD_DENY:
-        _log_decision(tool, action, level, "denied", task_id)
-        return f"'{tool}' is not permitted."
+    elif level == HARD_DENY:
+        should_invoke = False
+        outcome       = "denied"
+        early_result  = f"'{tool}' is not permitted."
 
-    if level == AUTO_ALLOW:
-        result = _invoke_with_timeout(tool, args, player, speak, contract)
-        _log_decision(tool, action, level, "auto-allowed", task_id)
-        return result
+    elif level == AUTO_ALLOW:
+        outcome = "auto-allowed"
 
-    if level == NOTIFY_ONLY:
-        result = _invoke_with_timeout(tool, args, player, speak, contract)
+    elif level == NOTIFY_ONLY:
+        outcome      = "notified"
+        notify_after = True
+
+    else:
+        assert level == ASK_AND_WAIT
+        prompt = f"I'm about to run {tool}" + (f" — {action}" if action else "") + "."
+
         if player is not None:
+            approved = CONFIRM.request(player, prompt, speak=speak)
+            outcome  = "approved" if approved else "denied"
+        else:
+            note = " (submitted interactively)" if submitted_interactively else " (system-submitted)"
+            approved, outcome = TASK_APPROVAL.wait_for_approval(task_id, prompt + note)
+
+        if not approved:
+            should_invoke = False
+            # Message text is the only signal agent/executor.py's
+            # _approval_outcome() has to distinguish "timed out" from
+            # "explicitly denied" (outcome itself isn't returned to the
+            # caller) — keep these two phrasings and don't merge them.
+            if outcome == "timeout":
+                early_result = f"Cancelled — '{tool}' timed out waiting for approval."
+            else:
+                early_result = f"Cancelled — '{tool}' was not approved."
+
+    if should_invoke:
+        result = _invoke_with_timeout(tool, args, player, speak, contract)
+        result = _apply_postcondition(tool, args, result)
+        if notify_after and player is not None:
             try:
                 player.write_log(f"NOTICE: ran {tool}" + (f" ({action})" if action else ""))
             except Exception:
                 pass
-        _log_decision(tool, action, level, "notified", task_id)
-        return result
-
-    # ask-and-wait
-    assert level == ASK_AND_WAIT
-    prompt = f"I'm about to run {tool}" + (f" — {action}" if action else "") + "."
-
-    if player is not None:
-        approved = CONFIRM.request(player, prompt, speak=speak)
-        outcome  = "approved" if approved else "denied"
     else:
-        note = " (submitted interactively)" if submitted_interactively else " (system-submitted)"
-        approved, outcome = TASK_APPROVAL.wait_for_approval(task_id, prompt + note)
+        result = early_result
 
     _log_decision(tool, action, level, outcome, task_id)
-    if not approved:
-        # Message text is the only signal agent/executor.py's
-        # _approval_outcome() has to distinguish "timed out" from
-        # "explicitly denied" (outcome itself isn't returned to the
-        # caller) — keep these two phrasings and don't merge them.
-        if outcome == "timeout":
-            return f"Cancelled — '{tool}' timed out waiting for approval."
-        return f"Cancelled — '{tool}' was not approved."
-    return _invoke_with_timeout(tool, args, player, speak, contract)
+    return result

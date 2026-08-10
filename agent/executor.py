@@ -21,7 +21,7 @@ from core.llm_client        import call_llm_text
 from core.tool_dispatch     import TOOL_DISPATCH
 from core.tool_gate         import dispatch_tool
 from core.tool_contracts    import get_contract
-from core.db                import log_task_event
+from core.db                import log_task_event, get_step_outcomes
 from config                 import BASE_DIR
 
 _log = logging.getLogger("jarvis.executor")
@@ -250,6 +250,30 @@ def _short_circuit_reason(result) -> str | None:
     return None
 
 
+def _is_postcondition_failure(result) -> bool:
+    """True if `result` is one of core/tool_gate.py's postcondition-check
+    failure strings (see core/postconditions.py) — the tool call itself
+    completed and returned a normal-looking success string, but an
+    independent check (a file that should now exist, an OS scheduler
+    entry that should now be registered, ...) found no evidence the
+    claimed effect actually happened.
+
+    Deliberately NOT part of _short_circuit_reason()'s vocabulary: those
+    four reasons are all unconditionally non-retryable for specific,
+    provable reasons (an approval decision won't change, invalid
+    parameters need different values, a timed-out call's thread may still
+    be running, a reference has nothing to resolve to). A postcondition
+    failure doesn't share that property — a transient filesystem hiccup
+    could legitimately succeed on retry — so instead of a hard
+    short-circuit, this is detected and re-raised as a real exception at
+    the call site below, feeding the *existing* except-Exception ->
+    analyze_error() -> _maybe_downgrade_retry() path, exactly like any
+    other runtime failure: retried, skipped, replanned, or aborted based
+    on context and the tool's own contract.retryable, not unconditionally
+    terminal."""
+    return isinstance(result, str) and result.startswith("Postcondition unmet — ")
+
+
 def _maybe_downgrade_retry(tool: str, decision: ErrorDecision, task_id: str | None) -> ErrorDecision:
     """A genuinely caught exception (unlike a short-circuited timeout —
     see _short_circuit_reason) means the previous attempt has definitely
@@ -293,6 +317,59 @@ def _call_tool(
             f"Unknown tool '{tool}' — no such tool exists. "
             f"Available tools: {sorted(TOOL_DISPATCH.keys())}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Task summary — sourced from get_step_outcomes(), not step descriptions
+# ---------------------------------------------------------------------------
+
+def _describe_outcome(o: dict) -> str:
+    """One task_events-derived outcome -> a short human-readable phrase.
+    Shared by both the deterministic fallback and the LLM prompt's
+    structured input, so the two can't describe the same step
+    differently."""
+    desc = o["description"] or o["tool"] or f"step {o['step_num']}"
+    if o["status"] == "done":
+        if o["detail"].startswith("recovered via fix"):
+            return f"{desc} (accomplished via an alternative approach after the first attempt failed)"
+        return desc
+    if o["status"] == "skipped":
+        return f"{desc} — SKIPPED ({o['detail'] or 'no reason recorded'})"
+    if o["status"] == "failed":
+        return f"{desc} — FAILED ({o['detail'] or 'no reason recorded'})"
+    return f"{desc} — outcome unknown"
+
+
+def _build_fallback_summary(goal: str, done: list, skipped: list, failed: list) -> str:
+    """No LLM call — used when call_llm_text fails/returns nothing, or
+    when there's no task_id to look outcomes up for at all. Must be
+    accurate on its own; it's reachable independently of the LLM path."""
+    if not skipped and not failed:
+        return f"All done, sir. Completed {len(done)} step(s) for: {goal[:60]}."
+    total = len(done) + len(skipped) + len(failed)
+    parts = [f"Completed {len(done)} of {total} step(s) for: {goal[:60]}, sir."]
+    if skipped:
+        parts.append("Skipped: " + "; ".join(_describe_outcome(o) for o in skipped) + ".")
+    if failed:
+        parts.append("Failed: " + "; ".join(_describe_outcome(o) for o in failed) + ".")
+    return " ".join(parts)
+
+
+def _build_summary_prompt(goal: str, done: list, skipped: list, failed: list) -> str:
+    lines = (
+        [f"- DONE: {_describe_outcome(o)}" for o in done]
+        + [f"- SKIPPED: {_describe_outcome(o)}" for o in skipped]
+        + [f"- FAILED: {_describe_outcome(o)}" for o in failed]
+    )
+    steps_str = "\n".join(lines) if lines else "(no steps recorded)"
+    return (
+        f'User goal: "{goal}"\n'
+        f"Step outcomes (accurate — not every step necessarily succeeded):\n{steps_str}\n\n"
+        "Write a single natural sentence summarising what actually happened. "
+        "Accurately reflect what was done, what was skipped, and what failed — "
+        "do not claim a skipped or failed step was completed. "
+        "Address the user as 'sir'."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +495,18 @@ class AgentExecutor:
                             success      = False
                             break
 
+                        if _is_postcondition_failure(result):
+                            # Unlike the four short_circuit reasons above,
+                            # this genuinely might be transient — raise it
+                            # as a real exception so it flows into the
+                            # except-Exception block below and gets the
+                            # same retry/skip/replan/abort treatment (and
+                            # the same contract.retryable gate) as any
+                            # other runtime failure, instead of always
+                            # failing the step outright. See
+                            # _is_postcondition_failure's docstring.
+                            raise RuntimeError(result)
+
                         step_results[step_num] = result
                         completed_steps.append(step)
                         log_task_event(
@@ -485,11 +574,17 @@ class AgentExecutor:
                                         task_id=task_id, step_num=step_num,
                                         submitted_interactively=submitted_interactively,
                                     )
-                                    res_short_circuit = _short_circuit_reason(res)
-                                    res_no_file_path  = isinstance(res, str) and any(
+                                    res_short_circuit    = _short_circuit_reason(res)
+                                    res_no_file_path     = isinstance(res, str) and any(
                                         marker in res for marker in _RECOVERY_NOT_EXECUTED_MARKERS
                                     )
-                                    if res_short_circuit or res_no_file_path:
+                                    # A postcondition failure on the recovery attempt itself is
+                                    # treated the same way as the other two — "this fix didn't
+                                    # actually take" — rather than re-raised into another round of
+                                    # analyze_error from *within* an already-in-progress REPLAN fix
+                                    # attempt, which isn't how this recovery path is structured.
+                                    res_postcondition_failed = _is_postcondition_failure(res)
+                                    if res_short_circuit or res_no_file_path or res_postcondition_failed:
                                         if res_short_circuit:
                                             reason = res_short_circuit
                                             _log.info(
@@ -498,6 +593,12 @@ class AgentExecutor:
                                                 "out). Autonomous code-fix recovery cannot complete in "
                                                 "this context.",
                                                 res_short_circuit, extra={"task_id": task_id},
+                                            )
+                                        elif res_postcondition_failed:
+                                            reason = "postcondition_failed"
+                                            _log.info(
+                                                "Recovery via code_helper completed but its postcondition "
+                                                "check failed: %s", res, extra={"task_id": task_id},
                                             )
                                         else:
                                             reason = "missing_file_path"
@@ -545,7 +646,7 @@ class AgentExecutor:
                     break
 
             if success:
-                return self._summarize(goal, completed_steps, speak, task_id=task_id)
+                return self._summarize(goal, speak, task_id=task_id)
 
             if replan_attempts >= self.MAX_REPLAN_ATTEMPTS:
                 msg = f"Task failed after {replan_attempts} replan attempts, sir."
@@ -561,15 +662,35 @@ class AgentExecutor:
             replan_attempts += 1
             plan = replan(goal, completed_steps, failed_step, failed_error, task_id=task_id)
 
-    def _summarize(self, goal: str, completed_steps: list, speak: Callable | None, task_id: str | None = None) -> str:
-        fallback  = f"All done, sir. Completed {len(completed_steps)} steps for: {goal[:60]}."
-        steps_str = "\n".join(f"- {s.get('description', '')}" for s in completed_steps)
-        prompt    = (
-            f'User goal: "{goal}"\n'
-            f"Completed steps:\n{steps_str}\n\n"
-            "Write a single natural sentence summarising what was accomplished. "
-            "Address the user as 'sir'. Be direct and positive."
-        )
+    def _summarize(self, goal: str, speak: Callable | None, task_id: str | None = None) -> str:
+        """Sourced from task_events (get_step_outcomes), not from a
+        parallel completed_steps list — completed_steps conflated a
+        genuinely 'done' step with one that was merely 'skipped'
+        (ErrorDecision.SKIP appends to it exactly like a real success
+        does), so both the LLM-fed prompt and the deterministic fallback
+        below used to describe skipped work as accomplished. Both paths
+        are fixed here, not just the LLM one — the fallback has the
+        identical bug and is independently reachable if the LLM call
+        fails."""
+        outcomes = get_step_outcomes(task_id)
+        done     = [o for o in outcomes if o["status"] == "done"]
+        skipped  = [o for o in outcomes if o["status"] == "skipped"]
+        # A 'failed' segment shouldn't normally reach _summarize() — a
+        # failed step aborts the whole plan before success=True is ever
+        # set — but included for robustness rather than assuming it can't
+        # happen (e.g. a future change to the success/failure wiring).
+        failed   = [o for o in outcomes if o["status"] == "failed"]
+
+        fallback = _build_fallback_summary(goal, done, skipped, failed)
+
+        if not outcomes:
+            # No task_id, or nothing logged for it — fall back to the
+            # old, coarser wording rather than claiming a precision the
+            # data doesn't support.
+            if speak: speak(fallback)
+            return fallback
+
+        prompt = _build_summary_prompt(goal, done, skipped, failed)
         try:
             summary = call_llm_text(prompt, task_id=task_id, purpose="summarize task")
             if summary:

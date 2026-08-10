@@ -1465,6 +1465,8 @@ class JarvisXL:
                 self._listen_deepgram()
             elif stt_engine == "vosk":
                 self._listen_vosk()
+            elif stt_engine == "whisper":
+                self._listen_whisper()
 
         except Exception as e:
             self.ui.write_log(f"ERR: Init failed — {e}")

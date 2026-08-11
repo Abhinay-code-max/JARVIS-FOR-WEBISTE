@@ -59,8 +59,9 @@ class SQLiteHandler(logging.Handler):
             with conn:
                 conn.execute(
                     "INSERT INTO log_events "
-                    "(task_id, level, source, message, detail, duration_ms, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "(task_id, level, source, message, detail, duration_ms, created_at, "
+                    "caller_id, caller_class, triggered_by) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         getattr(record, "task_id", None),
                         record.levelname,
@@ -69,6 +70,13 @@ class SQLiteHandler(logging.Handler):
                         detail,
                         getattr(record, "duration_ms", None),
                         record.created,
+                        # headless-extraction phase, Step 1.3 — only
+                        # populated by call sites that pass them via
+                        # logger.*(..., extra={...}); every existing call
+                        # site is unaffected and simply inserts NULL here.
+                        getattr(record, "caller_id", None),
+                        getattr(record, "caller_class", None),
+                        getattr(record, "triggered_by", None),
                     ),
                 )
         except Exception:

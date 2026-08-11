@@ -398,8 +398,23 @@ class AgentExecutor:
         cancel_flag: threading.Event | None = None,
         task_id:     str | None             = None,
         submitted_interactively: bool       = True,
+        caller_class: str                   = "desktop",
     ) -> str:
-        _log.info("Goal: %s", goal, extra={"task_id": task_id})
+        """caller_class (headless-extraction phase, Step 1.3): who
+        submitted this task — one of core/policy.py's CALLER_CLASSES,
+        defaulting to 'desktop' so every pre-existing caller of execute()
+        is unaffected. Threaded into every task_events row this method
+        logs via the local _log_event() wrapper below, so the resulting
+        audit trail is attributable regardless of which caller_class
+        submitted the task (see tests/test_caller_attribution.py's
+        Step-1.6-equivalent routing test)."""
+        _log.info("Goal: %s", goal, extra={"task_id": task_id, "caller_class": caller_class})
+
+        def _log_event(step_num, tool, desc, status, detail="", duration_ms=None):
+            log_task_event(
+                task_id, step_num, tool, desc, status, detail, duration_ms=duration_ms,
+                caller_id=caller_class, caller_class=caller_class, triggered_by=caller_class,
+            )
 
         replan_attempts = 0
         completed_steps: list = []
@@ -461,8 +476,8 @@ class AgentExecutor:
                     )
                     short_circuit = _short_circuit_reason(result, tool)
                     detail = f"{short_circuit}: {result}"
-                    log_task_event(
-                        task_id, step_num, tool, desc, "failed", detail,
+                    _log_event(
+                        step_num, tool, desc, "failed", detail,
                         duration_ms=int((time.monotonic() - step_start) * 1000),
                     )
                     failed_step  = step
@@ -470,7 +485,7 @@ class AgentExecutor:
                     success      = False
                     break
 
-                log_task_event(task_id, step_num, tool, desc, "started")
+                _log_event(step_num, tool, desc, "started")
 
                 while attempt <= 3:
                     if cancel_flag and cancel_flag.is_set():
@@ -497,8 +512,8 @@ class AgentExecutor:
                             # further down) decide whether a different
                             # overall approach is worth trying.
                             detail = f"{short_circuit}: {result}"
-                            log_task_event(
-                                task_id, step_num, tool, desc, "failed", detail,
+                            _log_event(
+                                step_num, tool, desc, "failed", detail,
                                 duration_ms=int((time.monotonic() - step_start) * 1000),
                             )
                             failed_step  = step
@@ -520,8 +535,8 @@ class AgentExecutor:
 
                         step_results[step_num] = result
                         completed_steps.append(step)
-                        log_task_event(
-                            task_id, step_num, tool, desc, "done", str(result)[:200],
+                        _log_event(
+                            step_num, tool, desc, "done", str(result)[:200],
                             duration_ms=int((time.monotonic() - step_start) * 1000),
                         )
                         step_ok = True
@@ -533,7 +548,7 @@ class AgentExecutor:
                         # this step into a success. Kept distinct from the
                         # terminal 'failed' status below so a tool's true
                         # failure rate isn't inflated by every transient retry.
-                        log_task_event(task_id, step_num, tool, desc, "attempt_failed", f"attempt {attempt}: {error_msg}")
+                        _log_event(step_num, tool, desc, "attempt_failed", f"attempt {attempt}: {error_msg}")
 
                         recovery = analyze_error(step, error_msg, attempt=attempt, task_id=task_id)
                         decision = recovery["decision"]
@@ -549,14 +564,14 @@ class AgentExecutor:
                             speak(user_msg)
 
                         if decision == ErrorDecision.RETRY:
-                            log_task_event(task_id, step_num, tool, desc, "retried", f"attempt {attempt} -> {attempt + 1}")
+                            _log_event(step_num, tool, desc, "retried", f"attempt {attempt} -> {attempt + 1}")
                             attempt += 1
                             time.sleep(2)
                             continue
 
                         elif decision == ErrorDecision.SKIP:
-                            log_task_event(
-                                task_id, step_num, tool, desc, "skipped", "skipped (non-critical)",
+                            _log_event(
+                                step_num, tool, desc, "skipped", "skipped (non-critical)",
                                 duration_ms=int((time.monotonic() - step_start) * 1000),
                             )
                             completed_steps.append(step)
@@ -565,8 +580,8 @@ class AgentExecutor:
 
                         elif decision == ErrorDecision.ABORT:
                             msg = f"Task aborted, sir. {recovery.get('reason', '')}"
-                            log_task_event(
-                                task_id, step_num, tool, desc, "failed", f"aborted: {recovery.get('reason', '')}",
+                            _log_event(
+                                step_num, tool, desc, "failed", f"aborted: {recovery.get('reason', '')}",
                                 duration_ms=int((time.monotonic() - step_start) * 1000),
                             )
                             if speak: speak(msg)
@@ -618,14 +633,14 @@ class AgentExecutor:
                                                 "the generated fix step.",
                                                 extra={"task_id": task_id},
                                             )
-                                        log_task_event(
-                                            task_id, step_num, tool, desc, "failed",
+                                        _log_event(
+                                            step_num, tool, desc, "failed",
                                             f"recovery fix did not execute ({reason}): {res}",
                                             duration_ms=int((time.monotonic() - step_start) * 1000),
                                         )
                                     else:
-                                        log_task_event(
-                                            task_id, step_num, fixed_step.get("tool"), desc, "done",
+                                        _log_event(
+                                            step_num, fixed_step.get("tool"), desc, "done",
                                             f"recovered via fix: {str(res)[:150]}",
                                             duration_ms=int((time.monotonic() - step_start) * 1000),
                                         )
@@ -634,8 +649,8 @@ class AgentExecutor:
                                         step_ok = True
                                         break
                                 except Exception as fix_err:
-                                    log_task_event(
-                                        task_id, step_num, tool, desc, "failed", f"fix generation failed: {fix_err}",
+                                    _log_event(
+                                        step_num, tool, desc, "failed", f"fix generation failed: {fix_err}",
                                         duration_ms=int((time.monotonic() - step_start) * 1000),
                                     )
 
@@ -648,8 +663,8 @@ class AgentExecutor:
                     failed_step  = step
                     failed_error = "Max retries exceeded"
                     success      = False
-                    log_task_event(
-                        task_id, step_num, tool, desc, "failed", "max retries exceeded",
+                    _log_event(
+                        step_num, tool, desc, "failed", "max retries exceeded",
                         duration_ms=int((time.monotonic() - step_start) * 1000),
                     )
 
@@ -665,8 +680,8 @@ class AgentExecutor:
                 return msg
 
             if speak: speak("Adjusting my approach, sir.")
-            log_task_event(
-                task_id, failed_step.get("step") if failed_step else None,
+            _log_event(
+                failed_step.get("step") if failed_step else None,
                 failed_step.get("tool") if failed_step else None, goal[:200],
                 "replanned", f"after step failure: {failed_error[:150]}",
             )

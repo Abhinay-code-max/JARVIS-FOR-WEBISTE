@@ -44,16 +44,38 @@ CREATE TABLE IF NOT EXISTS tasks (
     updated_at  REAL NOT NULL
 );
 
+-- caller_id/caller_class/triggered_by (added in the headless-extraction
+-- phase, nullable — see _ensure_column calls in get_conn() for existing
+-- installs): who/what is attributable for this row, once a request can
+-- arrive from somewhere other than the local desktop UI. caller_class is
+-- one of core/policy.py's CALLER_CLASSES ('desktop' or a 'service:*'
+-- value); caller_id is a finer-grained identifier within that class —
+-- at this phase (one token per class, see Step 1.5) it's simply a copy
+-- of caller_class, with room to diverge later if a class ever needs
+-- multiple distinguishable callers. triggered_by carries the same
+-- caller_class value at the point a task was submitted — kept as its
+-- own column rather than reused from caller_class so a future indirect
+-- trigger (e.g. a proactive nudge that itself submits a task) can record
+-- what actually caused the row to exist even if that differs from who's
+-- nominally attributed to it. All three are populated by
+-- agent/executor.py's AgentExecutor.execute() (task_events) and,
+-- opportunistically, by any logging call site that passes them via
+-- logging's `extra={}` (log_events) — most existing call sites don't yet
+-- have a real caller_class to report and leave these NULL, which is
+-- expected, not a gap to backfill retroactively.
 CREATE TABLE IF NOT EXISTS task_events (
-    event_id    INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id     TEXT NOT NULL REFERENCES tasks(task_id),
-    step_num    INTEGER,
-    tool        TEXT,
-    description TEXT,
-    status      TEXT,
-    detail      TEXT,
-    duration_ms INTEGER,
-    created_at  REAL NOT NULL
+    event_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id      TEXT NOT NULL REFERENCES tasks(task_id),
+    step_num     INTEGER,
+    tool         TEXT,
+    description  TEXT,
+    status       TEXT,
+    detail       TEXT,
+    duration_ms  INTEGER,
+    created_at   REAL NOT NULL,
+    caller_id    TEXT,
+    caller_class TEXT,
+    triggered_by TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_task_events_task_id ON task_events(task_id);
 
@@ -62,16 +84,20 @@ CREATE INDEX IF NOT EXISTS idx_task_events_task_id ON task_events(task_id);
 -- calls with no task_id, etc). task_id is nullable and deliberately NOT
 -- a widened task_events — see the logging-phase investigation for why
 -- (task_events' columns are shaped for a step ledger, not a general
--- level/source/message record).
+-- level/source/message record). caller_id/caller_class/triggered_by:
+-- same meaning as task_events' own columns above.
 CREATE TABLE IF NOT EXISTS log_events (
-    event_id    INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id     TEXT REFERENCES tasks(task_id),
-    level       TEXT NOT NULL,
-    source      TEXT NOT NULL,
-    message     TEXT NOT NULL,
-    detail      TEXT,
-    duration_ms INTEGER,
-    created_at  REAL NOT NULL
+    event_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id      TEXT REFERENCES tasks(task_id),
+    level        TEXT NOT NULL,
+    source       TEXT NOT NULL,
+    message      TEXT NOT NULL,
+    detail       TEXT,
+    duration_ms  INTEGER,
+    created_at   REAL NOT NULL,
+    caller_id    TEXT,
+    caller_class TEXT,
+    triggered_by TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_log_events_task_id    ON log_events(task_id);
 CREATE INDEX IF NOT EXISTS idx_log_events_created_at ON log_events(created_at);
@@ -268,6 +294,15 @@ def get_conn() -> sqlite3.Connection:
     # install's already-seeded desktop rows must read as caller_class=
     # 'desktop' after this migration, not NULL/unset).
     _ensure_column(conn, "permission_policy", "caller_class", "TEXT NOT NULL DEFAULT 'desktop'")
+    # Same headless-extraction phase, Step 1.3: caller attribution on the
+    # two event/log tables. Nullable, no DEFAULT — unlike permission_policy
+    # above, there's no correct non-NULL value to backfill onto rows that
+    # already existed before caller attribution existed at all; NULL
+    # honestly means "attribution unknown," not "was desktop."
+    for _table in ("task_events", "log_events"):
+        _ensure_column(conn, _table, "caller_id", "TEXT")
+        _ensure_column(conn, _table, "caller_class", "TEXT")
+        _ensure_column(conn, _table, "triggered_by", "TEXT")
     conn.commit()
     _local.conn = conn
 
@@ -434,6 +469,9 @@ def log_task_event(
     status:      str,
     detail:      str = "",
     duration_ms: int | None = None,
+    caller_id:    str | None = None,
+    caller_class: str | None = None,
+    triggered_by: str | None = None,
 ) -> None:
     """Insert one row into task_events. Callers run on a thread that
     already tolerates blocking (AgentExecutor's own per-task worker
@@ -449,6 +487,12 @@ def log_task_event(
     will not succeed). Keeping 'attempt_failed' distinct from 'failed'
     is what makes `GROUP BY tool, status` give a real failure rate
     instead of counting every transient retry as a failure.
+
+    caller_id/caller_class/triggered_by (headless-extraction phase, Step
+    1.3): all optional, all default None — every pre-existing call site
+    in this codebase is unaffected. See this table's own schema comment
+    for what each means; agent/executor.py's AgentExecutor.execute() is
+    the one caller that actually threads real values through today.
     """
     if not task_id:
         return
@@ -457,9 +501,13 @@ def log_task_event(
         with conn:
             conn.execute(
                 "INSERT INTO task_events "
-                "(task_id, step_num, tool, description, status, detail, duration_ms, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (task_id, step_num, tool, description, status, detail[:500], duration_ms, time.time()),
+                "(task_id, step_num, tool, description, status, detail, duration_ms, created_at, "
+                "caller_id, caller_class, triggered_by) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    task_id, step_num, tool, description, status, detail[:500], duration_ms, time.time(),
+                    caller_id, caller_class, triggered_by,
+                ),
             )
     except Exception:
         _log.warning(

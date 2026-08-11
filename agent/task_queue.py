@@ -45,6 +45,12 @@ class Task:
     # either way on this thread, see agent/executor.py), only the context
     # noted on the resulting approval prompt.
     submitted_interactively: bool = field(compare=False, default=True)
+    # Headless-extraction phase, Step 1.3: who submitted this task — one
+    # of core/policy.py's CALLER_CLASSES. Defaults to 'desktop' so every
+    # pre-existing submit() call site is unaffected. Threaded through to
+    # AgentExecutor.execute() so every task_events row it logs for this
+    # task's steps is correctly attributed (see agent/executor.py).
+    caller_class: str = field(compare=False, default="desktop")
 
 
 def _reconcile_interrupted_tasks() -> None:
@@ -153,6 +159,7 @@ class TaskQueue:
         speak:       Callable | None = None,
         on_complete: Callable | None = None,
         submitted_interactively: bool = True,
+        caller_class: str = "desktop",
     ) -> str:
 
         task_id = str(uuid.uuid4())[:8]
@@ -164,6 +171,7 @@ class TaskQueue:
             speak       = speak,
             on_complete = on_complete,
             submitted_interactively = submitted_interactively,
+            caller_class = caller_class,
         )
 
         with self._condition:
@@ -274,6 +282,7 @@ class TaskQueue:
                 cancel_flag = task.cancel_flag,
                 task_id     = task.task_id,
                 submitted_interactively = task.submitted_interactively,
+                caller_class = task.caller_class,
             )
 
             with self._lock:

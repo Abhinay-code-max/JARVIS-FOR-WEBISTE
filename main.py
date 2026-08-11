@@ -624,6 +624,7 @@ class JarvisXL:
                 speak       = self.speak,
                 on_complete = _on_done,
                 submitted_interactively = True,
+                caller_class = caller_class,
             )
             self.ui.write_log(f"AGENT: [{task_id}] started — {goal[:60]}")
             if not self.ui.muted:

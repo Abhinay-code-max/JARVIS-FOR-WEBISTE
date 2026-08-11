@@ -399,11 +399,16 @@ class ParseCalendarEventTest(unittest.TestCase):
 class SyncCalendarTest(ProactiveTestCase):
     def test_disabled_by_default_never_touches_calendar_auth(self):
         """calendar_enabled defaults to unset/False — _sync_calendar()
-        must return before even importing core.calendar_auth. Proven by
-        NOT registering any fake module: if it tried the real import,
-        this would raise (google-* packages aren't installed here)."""
-        loop = _RecordingLoop()
-        loop._sync_calendar()
+        must return before even importing core.calendar_auth. Forces
+        load_config() explicitly rather than trusting the ambient real
+        config (which could have calendar_enabled set for real once the
+        feature is actually in use — see the CI trigger's equivalent test
+        for a concrete case where that assumption broke). Proven by NOT
+        registering any fake module: if it tried the real import, this
+        would raise (google-* packages aren't installed here)."""
+        with patch.object(proactive, "load_config", lambda: {}):
+            loop = _RecordingLoop()
+            loop._sync_calendar()
         self.assertEqual(db.get_cached_calendar_events(), [])
 
     def test_enabled_populates_cache_from_api_response(self):
@@ -607,12 +612,27 @@ class ParseCiRunTest(unittest.TestCase):
 class SyncCiTest(ProactiveTestCase):
     def test_disabled_by_default_never_touches_requests_or_github_ci_auth(self):
         """github_ci_enabled defaults to unset/False — _sync_ci() must
-        return before even calling requests.get. Proven with a
-        raising side effect: if it were ever called, this test would
-        fail with that exception instead of passing quietly."""
-        with patch("requests.get", side_effect=AssertionError("must not be called")):
+        return before even calling requests.get. Forces load_config()
+        explicitly rather than trusting the ambient real config: this
+        machine now has github_ci_enabled genuinely set (the feature is
+        live), so without this the test would silently exercise the real
+        network path with the real stored PAT — a real bug this exact
+        test caught, see git history. Call-counted rather than relying on
+        an exception surviving _sync_ci()'s own broad except-Exception
+        (which would otherwise swallow a raised AssertionError here
+        without this test ever noticing)."""
+        calls = {"n": 0}
+
+        def _counting_get(*a, **kw):
+            calls["n"] += 1
+            raise AssertionError("must not be called")
+
+        with patch.object(proactive, "load_config", lambda: {}), \
+             patch("requests.get", side_effect=_counting_get):
             loop = _RecordingLoop()
             loop._sync_ci()
+
+        self.assertEqual(calls["n"], 0)
         self.assertEqual(db.get_cached_ci_runs(), [])
 
     def test_enabled_populates_cache_from_api_response_for_both_repos(self):
@@ -627,7 +647,7 @@ class SyncCiTest(ProactiveTestCase):
                 return _FakeGithubResponse({"workflow_runs": [_github_run(2)]})
             raise AssertionError(f"unexpected URL: {url}")
 
-        with patch.dict(sys.modules, {"core.github_ci_auth": fake_auth}), \
+        with patch("core.github_ci_auth", fake_auth, create=True), \
              patch.object(proactive, "load_config", lambda: cfg), \
              patch("requests.get", side_effect=_fake_get):
             _RecordingLoop()._sync_ci()
@@ -644,7 +664,7 @@ class SyncCiTest(ProactiveTestCase):
             seen_headers.append(headers)
             return _FakeGithubResponse({"workflow_runs": []})
 
-        with patch.dict(sys.modules, {"core.github_ci_auth": fake_auth}), \
+        with patch("core.github_ci_auth", fake_auth, create=True), \
              patch.object(proactive, "load_config", lambda: cfg), \
              patch("requests.get", side_effect=_fake_get):
             _RecordingLoop()._sync_ci()
@@ -658,7 +678,7 @@ class SyncCiTest(ProactiveTestCase):
         cfg       = {"github_ci_enabled": True}
         fake_auth = _fake_github_ci_auth_module(None)
 
-        with patch.dict(sys.modules, {"core.github_ci_auth": fake_auth}), \
+        with patch("core.github_ci_auth", fake_auth, create=True), \
              patch.object(proactive, "load_config", lambda: cfg), \
              patch("requests.get", side_effect=AssertionError("must not be called")):
             _RecordingLoop()._sync_ci()  # must not raise
@@ -674,7 +694,7 @@ class SyncCiTest(ProactiveTestCase):
 
         fake.get_github_token = _raise
 
-        with patch.dict(sys.modules, {"core.github_ci_auth": fake}), \
+        with patch("core.github_ci_auth", fake, create=True), \
              patch.object(proactive, "load_config", lambda: cfg):
             _RecordingLoop()._sync_ci()  # must not raise
 
@@ -695,7 +715,7 @@ class SyncCiTest(ProactiveTestCase):
                 return _FakeGithubResponse({"workflow_runs": [_github_run(1)]})
             return _FakeGithubResponse({"workflow_runs": [_github_run(2)]})
 
-        with patch.dict(sys.modules, {"core.github_ci_auth": fake_auth}), \
+        with patch("core.github_ci_auth", fake_auth, create=True), \
              patch.object(proactive, "load_config", lambda: cfg), \
              patch("requests.get", side_effect=_good_get):
             _RecordingLoop()._sync_ci()
@@ -708,7 +728,7 @@ class SyncCiTest(ProactiveTestCase):
                 raise ConnectionError("network down")
             return _FakeGithubResponse({"workflow_runs": [_github_run(3)]})
 
-        with patch.dict(sys.modules, {"core.github_ci_auth": fake_auth}), \
+        with patch("core.github_ci_auth", fake_auth, create=True), \
              patch.object(proactive, "load_config", lambda: cfg), \
              patch("requests.get", side_effect=_mixed_get):
             _RecordingLoop()._sync_ci()  # must not raise
@@ -1053,7 +1073,7 @@ class TickCadenceTest(ProactiveTestCase):
         loop  = _RecordingLoop(now=lambda: clock["t"])
 
         with patch.object(proactive, "load_config", lambda: cfg), \
-             patch.dict(sys.modules, {"core.github_ci_auth": fake_auth}), \
+             patch("core.github_ci_auth", fake_auth, create=True), \
              patch("requests.get", side_effect=_counting_get):
             loop._tick()                                            # due
             clock["t"] += timedelta(seconds=proactive.POLL_INTERVAL_SEC)

@@ -99,6 +99,7 @@ from recognition.wake_word import WakeWordDetector
 
 from core.tool_dispatch import TOOL_DISPATCH
 from core.tool_gate import dispatch_tool
+from core.policy import DESKTOP as _DESKTOP_CALLER, is_agent_task_allowed
 from core.confirm import CONFIRM
 from core.task_approval import TASK_APPROVAL
 from core.proactive import ProactiveLoop
@@ -556,7 +557,12 @@ class JarvisXL:
         return f"Registration complete for {name}: {', '.join(msgs)}."
 
     # ── Tool execution ────────────────────────────────────────────────────────
-    def _execute_tool(self, name: str, args: dict) -> str:
+    def _execute_tool(self, name: str, args: dict, caller_class: str = _DESKTOP_CALLER) -> str:
+        """caller_class defaults to 'desktop' so the one existing call
+        site (this method's own text/voice tool-calling loop) behaves
+        exactly as before — see core/policy.py's is_agent_task_allowed()
+        for why agent_task specifically needs its own check here rather
+        than through the normal dispatch_tool()/permission_policy path."""
         _log.info("Tool call: %s %r", name, args)
         self.ui.set_state("THINKING")
 
@@ -588,6 +594,13 @@ class JarvisXL:
             return result
 
         if name == "agent_task":
+            if not is_agent_task_allowed(caller_class):
+                # Hard-denied unconditionally for every service:* caller
+                # at this phase, regardless of anything in
+                # permission_policy — agent_task doesn't route through
+                # dispatch_tool() at all, so this is the only gate it has.
+                return "'agent_task' is not permitted for this caller."
+
             from agent.task_queue import get_queue, TaskPriority
             goal = args.get("goal", "").strip()
             if not goal:

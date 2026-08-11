@@ -318,6 +318,26 @@ def get_policy_level(tool_name: str, action: str | None, caller_class: str = DES
     return ASK_AND_WAIT if caller_class == DESKTOP else HARD_DENY
 
 
+def is_agent_task_allowed(caller_class: str) -> bool:
+    """agent_task bypasses dispatch_tool()/permission_policy entirely —
+    it's submitted via main.py's _execute_tool() special case, not
+    through TOOL_DISPATCH, so no row in this table (SERVICE_POLICY or
+    otherwise) can gate it (see this module's docstring). Verified via
+    the Step 1.2b investigation: once a plan IS submitted,
+    agent/task_queue.py's worker runs it through the normal
+    AgentExecutor.execute() -> _call_tool() -> dispatch_tool() path for
+    every individual step, so per-step tool access is already gated
+    normally — only the submission decision itself needed a separate
+    check, which is what this function is for.
+
+    Hard-denied unconditionally for every service:* class at this phase
+    — no allow-list exception, since agent_task is a meta-tool that can
+    chain into the rest of the registry; a specific named exception for
+    a real future workflow would be a deliberate addition on its own,
+    not a default here."""
+    return caller_class == DESKTOP
+
+
 def _truthy(v) -> bool:
     return str(v).strip().lower() in ("true", "1", "yes")
 

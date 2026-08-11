@@ -297,6 +297,69 @@ class DelegatedToolsCaveatTest(_PolicyTestCase):
         self.assertFalse(approved)
 
 
+class AgentTaskGapTest(unittest.TestCase):
+    """Step 1.2b: agent_task bypasses dispatch_tool()/permission_policy
+    entirely (submitted via main.py's _execute_tool() special case, not
+    TOOL_DISPATCH) — investigated and confirmed the narrower case: once
+    submitted, agent/task_queue.py's worker runs the plan through the
+    normal AgentExecutor.execute() -> _call_tool() -> dispatch_tool()
+    path for every step, so only the *submission* decision itself needed
+    a separate gate. core.policy.is_agent_task_allowed() is that gate.
+
+    main.py itself is never imported here — it runs heavy PyQt6/audio
+    bootstrap as an import-time side effect (see
+    core/tool_declarations.py's own docstring on exactly this), which is
+    why no other test in this suite imports it either. The wiring at the
+    actual call site is instead verified by reading main.py's real
+    source text — same static-regression-probe convention this project
+    already uses in tests/test_subprocess_timeouts.py's
+    NoBareSubprocessRunTest for a check that can't practically be
+    exercised at runtime without instantiating the whole desktop app."""
+
+    def test_desktop_is_allowed(self):
+        self.assertTrue(policy.is_agent_task_allowed(policy.DESKTOP))
+
+    def test_every_service_class_is_denied(self):
+        for caller_class in policy.SERVICE_CALLER_CLASSES:
+            self.assertFalse(
+                policy.is_agent_task_allowed(caller_class),
+                f"agent_task must be denied for {caller_class}",
+            )
+
+    def test_unconditional_no_allow_list_exception_even_for_bugfix(self):
+        # service:bugfix has the broadest allow-list of the four service
+        # classes elsewhere in this file — agent_task must still be
+        # denied for it specifically, since the plan calls for no
+        # exception at this phase for any class.
+        self.assertFalse(policy.is_agent_task_allowed(policy.SERVICE_BUGFIX))
+
+    def test_main_py_agent_task_branch_actually_calls_the_gate(self):
+        """Static wiring check: the real source that will actually run,
+        not a description of intent. Confirms the gate is called and its
+        negative result is actually returned early, inside the
+        agent_task branch specifically — not merely present somewhere
+        else in the file."""
+        main_src = (Path(__file__).resolve().parent.parent / "main.py").read_text(encoding="utf-8")
+        branch_start = main_src.find('if name == "agent_task":')
+        self.assertNotEqual(branch_start, -1, "agent_task branch not found in main.py")
+
+        # The branch body, up to the next top-level `if name ==` sibling
+        # branch (a generous but bounded slice — the real check must
+        # appear near the very top of this branch, before any of the
+        # branch's other logic runs).
+        next_branch = main_src.find('if name ==', branch_start + 10)
+        branch_body = main_src[branch_start:next_branch if next_branch != -1 else branch_start + 800]
+
+        self.assertIn("is_agent_task_allowed(caller_class)", branch_body)
+        self.assertIn("is not permitted", branch_body)
+
+    def test_main_py_execute_tool_accepts_caller_class_with_a_desktop_default(self):
+        """The signature change itself — default-preserving, same
+        pattern as dispatch_tool()'s own caller_class parameter."""
+        main_src = (Path(__file__).resolve().parent.parent / "main.py").read_text(encoding="utf-8")
+        self.assertIn("def _execute_tool(self, name: str, args: dict, caller_class: str = _DESKTOP_CALLER)", main_src)
+
+
 class PreExistingInstallMigrationTest(unittest.TestCase):
     """Simulates a real pre-phase-1 install: a permission_policy table
     that predates the caller_class column, already holding real seeded

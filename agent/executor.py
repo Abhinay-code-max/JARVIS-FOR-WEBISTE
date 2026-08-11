@@ -216,7 +216,7 @@ def _approval_outcome(result) -> str | None:
     return None
 
 
-def _short_circuit_reason(result) -> str | None:
+def _short_circuit_reason(result, tool: str | None = None) -> str | None:
     """Classifies a string result that must fail the step immediately —
     never retried, never routed through analyze_error's RETRY branch —
     because retrying wouldn't help (a bad permission decision, invalid
@@ -229,14 +229,23 @@ def _short_circuit_reason(result) -> str | None:
     to time-box in the first place.
 
     Returns a short reason tag ('approval_timeout' | 'approval_denied' |
-    'validation_failed' | 'execution_timeout' | 'unresolved_reference') or
-    None if `result` is an ordinary tool result that should proceed
-    normally. 'unresolved_reference' is defense in depth, not the expected
-    path — agent/planner.py's _validate_and_fix_plan already rejects any
-    self/forward/nonexistent step reference before a plan is ever handed
-    to the executor; the only way this fires in practice is a referenced
-    step being legitimately skipped at runtime, which can't be caught at
-    plan-creation time."""
+    'validation_failed' | 'execution_timeout' | 'unresolved_reference' |
+    'hard_denied') or None if `result` is an ordinary tool result that
+    should proceed normally. 'unresolved_reference' is defense in depth,
+    not the expected path — agent/planner.py's _validate_and_fix_plan
+    already rejects any self/forward/nonexistent step reference before a
+    plan is ever handed to the executor; the only way this fires in
+    practice is a referenced step being legitimately skipped at runtime,
+    which can't be caught at plan-creation time.
+
+    'hard_denied' needs `tool` (the exact tool name the caller just
+    invoked) to recognize core/tool_gate.py's hard-deny refusal, since
+    that string embeds the tool's own name and nothing else distinctive —
+    an exact-string match against the specific tool just called is both
+    simpler and strictly more precise than a generic substring match
+    would be. Same non-retryable reasoning as approval_denied: hard-deny
+    is unconditional by design, so no rephrasing/retry/replan of the same
+    tool call can ever turn a denial into an allow."""
     outcome = _approval_outcome(result)
     if outcome:
         return f"approval_{outcome}"
@@ -247,6 +256,8 @@ def _short_circuit_reason(result) -> str | None:
             return "execution_timeout"
         if result.startswith("Unresolved — "):
             return "unresolved_reference"
+        if tool and result == f"'{tool}' is not permitted.":
+            return "hard_denied"
     return None
 
 
@@ -448,7 +459,7 @@ class AgentExecutor:
                         f"{ref_err.step_num}'s output, which is not "
                         f"available (skipped, failed, or never ran)."
                     )
-                    short_circuit = _short_circuit_reason(result)
+                    short_circuit = _short_circuit_reason(result, tool)
                     detail = f"{short_circuit}: {result}"
                     log_task_event(
                         task_id, step_num, tool, desc, "failed", detail,
@@ -470,12 +481,12 @@ class AgentExecutor:
                             submitted_interactively=submitted_interactively,
                         )
 
-                        short_circuit = _short_circuit_reason(result)
+                        short_circuit = _short_circuit_reason(result, tool)
                         if short_circuit:
                             # None of these are transient or fixable by
                             # blindly re-running the same call — see
                             # _short_circuit_reason's docstring for why
-                            # each of the four reasons ends here instead
+                            # each of the five reasons ends here instead
                             # of going through analyze_error's RETRY
                             # branch or the REPLAN-fix cascade (which
                             # itself retargets code_helper — also gated —
@@ -574,7 +585,7 @@ class AgentExecutor:
                                         task_id=task_id, step_num=step_num,
                                         submitted_interactively=submitted_interactively,
                                     )
-                                    res_short_circuit    = _short_circuit_reason(res)
+                                    res_short_circuit    = _short_circuit_reason(res, fixed_step.get("tool"))
                                     res_no_file_path     = isinstance(res, str) and any(
                                         marker in res for marker in _RECOVERY_NOT_EXECUTED_MARKERS
                                     )

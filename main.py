@@ -557,6 +557,48 @@ class JarvisXL:
         return f"Registration complete for {name}: {', '.join(msgs)}."
 
     # ── Tool execution ────────────────────────────────────────────────────────
+    # ── Hermes network boundary (Step 1.5/1.7) ──────────────────────────────────
+    def _start_hermes_server(self) -> None:
+        """Only runs when config's network_api_enabled is on — otherwise
+        fastapi/uvicorn/websockets aren't even installed (see
+        core/installer.py's opt-in _NETWORK_API list), so this returns
+        immediately without importing anything from api/hermes_app.py.
+
+        Hosts api/hermes_app.py's FastAPI app in a background thread of
+        this same process — the desktop app IS the Hermes host; core/
+        hermes_client.py (used by _execute_tool above) is then this same
+        process acting as that server's own most-trusted (desktop)
+        caller. Any failure here (port already bound, import error, no
+        desktop token minted yet) is logged and swallowed — the app's
+        core voice/text functionality never depends on this succeeding,
+        only the two Step 1.7 branches in _execute_tool that fall back to
+        their pre-Step-1.7 in-process behavior when it hasn't.
+
+        127.0.0.1:8765 hardcoded here too — matches api/hermes_app.py's
+        own __main__ entrypoint exactly; going beyond localhost is Step
+        1.5.x's still-open, explicitly-not-this-module's decision."""
+        if not self._config.get("network_api_enabled"):
+            return
+        try:
+            import uvicorn
+            from api.hermes_app import create_app
+            from core import hermes_auth
+            from core.policy import DESKTOP as _desktop
+
+            if hermes_auth.get_token(_desktop) is None:
+                _log.warning(
+                    "network_api_enabled is on but no desktop Hermes token is "
+                    "minted — run: python -m core.hermes_auth mint desktop. "
+                    "Starting the server anyway; every request will 401 until "
+                    "that's done."
+                )
+
+            config = uvicorn.Config(create_app(), host="127.0.0.1", port=8765, log_level="warning")
+            server = uvicorn.Server(config)
+            server.run()
+        except Exception as e:
+            _log.warning("Hermes server did not start — network_api_enabled features will use their in-process fallback: %s", e)
+
     def _execute_tool(self, name: str, args: dict, caller_class: str = _DESKTOP_CALLER) -> str:
         """caller_class defaults to 'desktop' so the one existing call
         site (this method's own text/voice tool-calling loop) behaves
@@ -601,38 +643,79 @@ class JarvisXL:
                 # dispatch_tool() at all, so this is the only gate it has.
                 return "'agent_task' is not permitted for this caller."
 
-            from agent.task_queue import get_queue, TaskPriority
             goal = args.get("goal", "").strip()
             if not goal:
                 return "No goal was provided for the background task."
-            prio_map = {
-                "high":   TaskPriority.HIGH,
-                "normal": TaskPriority.NORMAL,
-                "low":    TaskPriority.LOW,
-            }
-            priority = prio_map.get(str(args.get("priority", "normal")).lower(),
-                                    TaskPriority.NORMAL)
+            priority_str = str(args.get("priority", "normal")).lower()
 
-            def _on_done(task_id: str, result: str) -> None:
-                self.ui.write_log(f"AGENT: [{task_id}] complete")
-                if result:
-                    self.speak(str(result))
+            # Headless-extraction phase, Step 1.7: prefer the real Hermes
+            # REST call (POST /tasks, desktop-token authenticated) over
+            # the pre-Step-1.7 in-process get_queue().submit() — this
+            # branch has a genuine 1:1 REST equivalent, unlike the general
+            # TOOL_DISPATCH path below (see api/hermes_app.py's WS relay
+            # docstring / core/hermes_client.py for why that one can't
+            # migrate the same way). Falls back to the in-process call on
+            # any failure (network_api_enabled off, server not up yet, no
+            # desktop token minted) so the feature itself never regresses
+            # — logged as a warning so a persistently broken Hermes path
+            # stays discoverable instead of silently masked forever.
+            task_id = None
+            if self._config.get("network_api_enabled"):
+                try:
+                    from core import hermes_client
+                    task_id = hermes_client.submit_task(goal, priority_str)
+                    self.ui.write_log(f"AGENT: [{task_id}] started — {goal[:60]}")
+                    threading.Thread(
+                        target=self._poll_hermes_task, args=(task_id,), daemon=True
+                    ).start()
+                except Exception as e:
+                    _log.warning("Hermes agent_task submission failed — falling back to in-process: %s", e)
+                    task_id = None
 
-            task_id = get_queue().submit(
-                goal        = goal,
-                priority    = priority,
-                speak       = self.speak,
-                on_complete = _on_done,
-                submitted_interactively = True,
-                caller_class = caller_class,
-            )
-            self.ui.write_log(f"AGENT: [{task_id}] started — {goal[:60]}")
+            if task_id is None:
+                from agent.task_queue import get_queue, TaskPriority
+                prio_map = {
+                    "high":   TaskPriority.HIGH,
+                    "normal": TaskPriority.NORMAL,
+                    "low":    TaskPriority.LOW,
+                }
+                priority = prio_map.get(priority_str, TaskPriority.NORMAL)
+
+                def _on_done(task_id: str, result: str) -> None:
+                    self.ui.write_log(f"AGENT: [{task_id}] complete")
+                    if result:
+                        self.speak(str(result))
+
+                task_id = get_queue().submit(
+                    goal        = goal,
+                    priority    = priority,
+                    speak       = self.speak,
+                    on_complete = _on_done,
+                    submitted_interactively = True,
+                    caller_class = caller_class,
+                )
+                self.ui.write_log(f"AGENT: [{task_id}] started — {goal[:60]}")
+
             if not self.ui.muted:
                 self.ui.set_state("LISTENING")
             return f"Working on that in the background, sir. Task {task_id}."
 
         if name == "list_pending_approvals":
-            pending = TASK_APPROVAL.list_pending()
+            # Step 1.7: same Hermes-first, in-process-fallback shape as
+            # agent_task above — GET /approvals is a faithful equivalent
+            # of TASK_APPROVAL.list_pending() (same underlying call,
+            # server-side).
+            pending = None
+            if self._config.get("network_api_enabled"):
+                try:
+                    from core import hermes_client
+                    pending = hermes_client.list_pending_approvals()
+                except Exception as e:
+                    _log.warning("Hermes approvals listing failed — falling back to in-process: %s", e)
+                    pending = None
+            if pending is None:
+                pending = TASK_APPROVAL.list_pending()
+
             if not pending:
                 return "No background tasks are waiting on approval right now."
             lines = [
@@ -648,7 +731,24 @@ class JarvisXL:
             except (TypeError, ValueError):
                 return "Please give me a valid approval ID — say 'list pending approvals' to see them."
             approve = str(args.get("approve", "true")).strip().lower() not in ("false", "no", "0", "deny", "denied")
-            ok = TASK_APPROVAL.answer(approval_id, approve)
+
+            # Step 1.7: same Hermes-first, in-process-fallback shape —
+            # POST /approvals/{id} (desktop-only, Step 1.6b) is a
+            # faithful equivalent of TASK_APPROVAL.answer(). `ok = None`
+            # is the "didn't even get an answer" sentinel that triggers
+            # the fallback; both the Hermes and in-process paths return a
+            # real bool once one of them actually runs.
+            ok = None
+            if self._config.get("network_api_enabled"):
+                try:
+                    from core import hermes_client
+                    ok = hermes_client.resolve_approval(approval_id, approve)
+                except Exception as e:
+                    _log.warning("Hermes approval resolution failed — falling back to in-process: %s", e)
+                    ok = None
+            if ok is None:
+                ok = TASK_APPROVAL.answer(approval_id, approve)
+
             if not ok:
                 return f"Approval #{approval_id} isn't waiting on a decision — it may already be resolved or never existed."
             return f"Approval #{approval_id} {'granted' if approve else 'denied'}. The task will continue shortly."
@@ -679,6 +779,31 @@ class JarvisXL:
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
         return result
+
+    def _poll_hermes_task(self, task_id: str) -> None:
+        """Step 1.7: HTTP has no push equivalent to TaskQueue's in-process
+        on_complete callback, so a Hermes-submitted agent_task (see
+        _execute_tool above) is followed up here instead. Bounded at an
+        hour, well past any real ask-and-wait approval timeout, purely as
+        a runaway-loop backstop — real completion is what actually ends
+        this early almost every time."""
+        from core import hermes_client
+        deadline = time.time() + 3600
+        while time.time() < deadline:
+            try:
+                status = hermes_client.get_task_status(task_id)
+            except hermes_client.HermesUnavailable as e:
+                _log.warning("Lost contact with Hermes while polling task %s: %s", task_id, e)
+                return
+            if status is None:
+                return
+            if status["status"] in ("completed", "failed", "cancelled"):
+                self.ui.write_log(f"AGENT: [{task_id}] complete")
+                result = status.get("result")
+                if result:
+                    self.speak(str(result))
+                return
+            time.sleep(1.0)
 
     # ── LLM processing loop ───────────────────────────────────────────────────
     def _process_message(self, user_text: str) -> None:
@@ -1050,6 +1175,9 @@ class JarvisXL:
                 finally:
                     _stt_done.set()
 
+            def _do_hermes():
+                self._start_hermes_server()
+
             def _do_tts():
                 try:
                     self.ui.write_log(f"SYS: Loading {tts_engine.upper()} TTS…")
@@ -1074,6 +1202,7 @@ class JarvisXL:
             threading.Thread(target=_do_warmup, daemon=True).start()
             threading.Thread(target=_do_stt,    daemon=True).start()
             threading.Thread(target=_do_tts,    daemon=True).start()
+            threading.Thread(target=_do_hermes, daemon=True).start()
 
             _warmup_done.wait(timeout=60)
             _stt_done.wait(timeout=60)

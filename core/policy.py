@@ -46,6 +46,7 @@ from __future__ import annotations
 import logging
 import threading
 
+import core.db as _db
 from core.db import get_conn
 
 _log = logging.getLogger("jarvis.policy")
@@ -223,7 +224,21 @@ SERVICE_POLICY: dict[str, list[tuple[str, str | None, str]]] = {
 }
 
 _seed_lock = threading.Lock()
-_seeded    = False
+# Keyed on the DB path actually seeded, not a bare bool — a bool alone
+# would go stale the moment the underlying DB changes under a live
+# process (core/db.py's DB_PATH/get_conn() are designed to be
+# redirectable — every test module in tests/ does exactly this via its
+# own _use_temp_db()). A real cross-test-pollution bug this exact gap
+# caused: tests/test_hermes_api.py's setUp() redirects to a fresh temp
+# DB per test; once any earlier test anywhere in the same process had
+# already set _seeded_for_path to a *different* DB_PATH, a bare bool
+# would report "already seeded" for the new, actually-empty DB, silently
+# falling every policy lookup through to get_policy_level()'s unlisted-
+# tool fallback — caught via tests/test_verification.py's
+# PostconditionFailureRetryWiringTest failing only when run after
+# test_hermes_api.py in the same `python -m unittest discover` process,
+# never in isolation.
+_seeded_for_path: object = None
 
 
 def _row_exists(conn, tool_name: str, action: str | None, caller_class: str) -> bool:
@@ -277,14 +292,15 @@ def seed_default_policy() -> None:
 
 
 def _ensure_seeded() -> None:
-    global _seeded
-    if _seeded:
+    global _seeded_for_path
+    current_path = _db.DB_PATH
+    if _seeded_for_path == current_path:
         return
     with _seed_lock:
-        if _seeded:
+        if _seeded_for_path == current_path:
             return
         seed_default_policy()
-        _seeded = True
+        _seeded_for_path = current_path
 
 
 def get_policy_level(tool_name: str, action: str | None, caller_class: str = DESKTOP) -> str:

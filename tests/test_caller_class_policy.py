@@ -55,7 +55,14 @@ import core.confirm       as confirm  # noqa: E402
 class _PolicyTestCase(unittest.TestCase):
     def setUp(self):
         _use_temp_db()
-        policy._seeded = False   # force a fresh seed pass per test — module-level cache
+        # seed_default_policy() is idempotent (per-row existence checks)
+        # and called directly here rather than relying on
+        # get_policy_level()'s lazy _ensure_seeded() cache, so this
+        # test's own fresh temp DB is seeded synchronously regardless of
+        # whether some earlier test already triggered seeding against a
+        # different DB_PATH in this same process (core/policy.py's
+        # _ensure_seeded() cache is itself keyed on DB_PATH now, so it
+        # would get this right lazily too — this is just belt-and-suspenders).
         policy.seed_default_policy()
 
 
@@ -152,6 +159,53 @@ class SeedIdempotencyTest(_PolicyTestCase):
                     policy._row_exists(conn, tool_name, action, caller_class),
                     f"missing {caller_class} row for {tool_name}/{action}",
                 )
+
+
+class SeedCacheSurvivesDbSwitchTest(unittest.TestCase):
+    """Regression test for a real cross-test-pollution bug found while
+    building tests/test_hermes_api.py: _ensure_seeded()'s cache used to
+    be a bare bool, set True the first time ANY test seeded ANY DB in
+    this process — so a later test that switched core.db.DB_PATH to its
+    own fresh temp DB would see the stale "already seeded" flag and skip
+    seeding its own, genuinely-empty DB. Concretely broke
+    tests/test_verification.py's PostconditionFailureRetryWiringTest —
+    not because that file did anything wrong, but because
+    tests/test_hermes_api.py happens to sort alphabetically right before
+    it under `python -m unittest discover`. Fixed by keying the cache on
+    the DB path actually seeded, not a bare bool — this test proves the
+    fix directly, switching DB_PATH twice within one process, matching
+    exactly what a full `discover` run does across files."""
+
+    def test_ensure_seeded_reseeds_after_switching_to_a_different_db_path(self):
+        first_db  = _use_temp_db()
+        policy._ensure_seeded()
+        count_first = db.get_conn().execute("SELECT COUNT(*) FROM permission_policy").fetchone()[0]
+        self.assertGreater(count_first, 0)
+
+        second_db = _use_temp_db()
+        self.assertNotEqual(first_db, second_db)
+        # Before the fix: _ensure_seeded() would see the stale
+        # "already seeded" bool and skip seeding this brand-new,
+        # genuinely-empty DB entirely.
+        policy._ensure_seeded()
+        count_second = db.get_conn().execute("SELECT COUNT(*) FROM permission_policy").fetchone()[0]
+        self.assertGreater(count_second, 0, "second DB was never seeded — the stale-cache bug is back")
+        self.assertEqual(count_first, count_second)
+
+    def test_get_policy_level_gives_real_answers_after_a_db_switch_mid_process(self):
+        """The actual, concrete symptom: an unlisted-tool fallback
+        answer for the WRONG reason (missing rows) rather than the real
+        one (a genuine policy decision) — this is what turned into
+        AgentExecutor blocking for real on TASK_APPROVAL.wait_for_approval()
+        with nothing able to ever answer it."""
+        _use_temp_db()
+        self.assertEqual(policy.get_policy_level("weather_report", None, policy.DESKTOP), policy.AUTO_ALLOW)
+
+        _use_temp_db()  # switch to a second, fresh, unseeded-until-now DB
+        # Must still resolve to the real seeded answer, not silently fall
+        # through to the generic "unlisted tool" fallback just because
+        # seeding was skipped for this DB.
+        self.assertEqual(policy.get_policy_level("weather_report", None, policy.DESKTOP), policy.AUTO_ALLOW)
 
 
 class DispatchToolCallerClassIntegrationTest(_PolicyTestCase):

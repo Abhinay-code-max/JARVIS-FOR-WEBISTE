@@ -67,6 +67,20 @@ _CALENDAR: list[tuple[str, str]] = [
     ("googleapiclient",      "google-api-python-client"),
 ]
 
+# api/hermes_app.py's FastAPI + WebSocket network boundary — headless-
+# extraction phase, Step 1.5. Only installed when the user has actually
+# opted in (config's network_api_enabled), not unconditionally like
+# _CORE, since most installs won't run this at all (it's off by default
+# and, as of this phase, only ever bound to 127.0.0.1 — see
+# api/hermes_app.py's module docstring for why going beyond that is a
+# deliberately unresolved, explicitly-confirmed-first decision, not
+# something this installer list implies is ready).
+_NETWORK_API: list[tuple[str, str]] = [
+    ("fastapi",    "fastapi"),
+    ("uvicorn",    "uvicorn[standard]"),
+    ("websockets", "websockets"),
+]
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -111,6 +125,8 @@ def install_for_config(config: dict, log: Callable | None = None) -> None:
         needed += _WINDOWS
     if config.get("calendar_enabled"):
         needed += _CALENDAR
+    if config.get("network_api_enabled"):
+        needed += _NETWORK_API
 
     # Deduplicate (preserve order, key = pip name)
     seen: set[str] = set()

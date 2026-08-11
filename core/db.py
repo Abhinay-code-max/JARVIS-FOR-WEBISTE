@@ -125,18 +125,32 @@ CREATE TABLE IF NOT EXISTS contacts (
     exact_name TEXT NOT NULL
 );
 
--- tool_name -> default permission level (auto-allow | notify-only |
--- ask-and-wait | hard-deny). `action` is nullable: NULL is the tool-wide
--- default row, a specific value overrides it for tools split by action
--- (computer_control, browser_control, file_controller, computer_settings,
--- file_processor, game_updater — see core/policy.py). No UNIQUE/PK
--- constraint on (tool_name, action) because SQLite doesn't dedupe NULLs
--- there; core/policy.py's seed function is idempotent via a row-count
--- check instead (same pattern as the memory/contacts migrations above).
+-- (tool_name, caller_class) -> default permission level (auto-allow |
+-- notify-only | ask-and-wait | hard-deny). `action` is nullable: NULL is
+-- the tool-wide default row, a specific value overrides it for tools
+-- split by action (computer_control, browser_control, file_controller,
+-- computer_settings, file_processor, game_updater — see core/policy.py).
+-- No UNIQUE/PK constraint on (tool_name, action, caller_class) because
+-- SQLite doesn't dedupe NULLs there; core/policy.py's seed function is
+-- idempotent via a row-count check instead (same pattern as the
+-- memory/contacts migrations above).
+--
+-- caller_class (added in the headless-extraction phase, backfilled to
+-- 'desktop' for every pre-existing row via _ensure_column below — see
+-- get_conn()): 'desktop' (the local PyQt6 client — unlisted tool falls
+-- back to ask-and-wait, same as always) or one of the four
+-- 'service:<name>' network-boundary classes (unlisted tool falls back to
+-- hard-deny — default-deny, explicit allow-list up, a materially
+-- different fallback than desktop's, see core/policy.py's
+-- get_policy_level()). This is additive to the table's existing
+-- structure, not a restructuring: desktop's rows and lookup behavior are
+-- unchanged, only the new dimension and the four service classes' own
+-- rows are new.
 CREATE TABLE IF NOT EXISTS permission_policy (
-    tool_name TEXT NOT NULL,
-    action    TEXT,
-    level     TEXT NOT NULL
+    tool_name    TEXT NOT NULL,
+    action       TEXT,
+    level        TEXT NOT NULL,
+    caller_class TEXT NOT NULL DEFAULT 'desktop'
 );
 CREATE INDEX IF NOT EXISTS idx_permission_policy_tool ON permission_policy(tool_name);
 
@@ -248,6 +262,12 @@ def get_conn() -> sqlite3.Connection:
     # task_events table that already existed before duration_ms was
     # introduced — do that explicitly, idempotently.
     _ensure_column(conn, "task_events", "duration_ms", "INTEGER")
+    # Same for permission_policy's caller_class, added in the headless-
+    # extraction phase — the literal DEFAULT 'desktop' here is what
+    # SQLite backfills into every pre-existing row (a real, existing
+    # install's already-seeded desktop rows must read as caller_class=
+    # 'desktop' after this migration, not NULL/unset).
+    _ensure_column(conn, "permission_policy", "caller_class", "TEXT NOT NULL DEFAULT 'desktop'")
     conn.commit()
     _local.conn = conn
 

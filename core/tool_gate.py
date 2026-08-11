@@ -29,16 +29,69 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from pathlib import Path
 
 from core.tool_dispatch    import TOOL_DISPATCH
 from core.tool_contracts   import get_contract, ToolContract
 from core.confirm          import CONFIRM
-from core.policy           import get_policy_level, ACTION_EXTRACTORS, ASK_AND_WAIT, HARD_DENY, AUTO_ALLOW, NOTIFY_ONLY
+from core.policy           import (
+    get_policy_level, ACTION_EXTRACTORS, ASK_AND_WAIT, HARD_DENY, AUTO_ALLOW, NOTIFY_ONLY,
+    DESKTOP,
+)
 from core.task_approval    import TASK_APPROVAL
 from core.postconditions   import check_postcondition
 from core.db                import get_conn
 
 _log = logging.getLogger("jarvis.tool_gate")
+
+# Tools additionally scoped by an allowed-path-prefix check for non-
+# desktop (service:*) callers, on top of whatever permission_policy level
+# applies — see SERVICE_PROJECT_ROOTS/_validate_service_path_scope()
+# below. Only file_controller today: the one service:*-allow-listed tool
+# whose args name a filesystem path at all.
+SERVICE_PATH_SCOPED_TOOLS = {"file_controller"}
+
+# Best-known root(s) a service:* caller's file_controller calls may
+# touch — deliberately narrower than desktop's own _SAFE_ROOTS
+# (Path.home(), in actions/file_controller.py), which is unchanged for
+# the desktop caller class. Currently just this repo's own checkout —
+# the only path verifiable from inside this repo. eyv-website-2's local
+# checkout path (if service:bugfix needs to touch it too) is NOT
+# included here: flagged as an open question needing confirmation before
+# service:bugfix's file_controller access is actually useful for that
+# repo, same as core/policy.py's web_search/flight_finder scope question
+# for service:personal — not decided silently either way.
+SERVICE_PROJECT_ROOTS: list[Path] = [
+    Path(__file__).resolve().parent.parent,  # this repo's own root
+]
+
+
+def _validate_service_path_scope(tool: str, args: dict, caller_class: str) -> str | None:
+    """Returns None if `args`'s path argument (if any) resolves inside
+    SERVICE_PROJECT_ROOTS, else a short rejection reason. No-op for the
+    desktop caller class (its own, broader path check inside
+    actions/file_controller.py is unchanged) and for tools outside
+    SERVICE_PATH_SCOPED_TOOLS. Reuses actions/file_controller.py's own
+    _resolve_path() (shortcut keywords like "desktop"/"downloads" plus
+    expanduser) rather than a separate resolution scheme, so this check
+    evaluates the exact same path the tool itself will actually use —
+    lazy import to keep core/tool_gate.py's own module level free of
+    actions/* imports, matching core/tool_dispatch.py's existing
+    per-wrapper lazy-import convention."""
+    if caller_class == DESKTOP or tool not in SERVICE_PATH_SCOPED_TOOLS:
+        return None
+
+    from actions.file_controller import _resolve_path
+
+    raw_path = args.get("path") or "desktop"  # file_controller's own default
+    try:
+        resolved = _resolve_path(raw_path).resolve()
+    except Exception:
+        return f"path {raw_path!r} could not be resolved."
+
+    if any(resolved == root or resolved.is_relative_to(root) for root in SERVICE_PROJECT_ROOTS):
+        return None
+    return f"path {raw_path!r} is outside the allowed project directories for caller class {caller_class!r}."
 
 # Tools whose own CONFIRM.request() call(s) stay in place instead of a
 # single dispatch-entry gate:
@@ -290,12 +343,20 @@ def dispatch_tool(
     speak,
     task_id: str | None = None,
     submitted_interactively: bool = True,
+    caller_class: str = DESKTOP,
 ) -> str:
-    """Validates input, evaluates permission_policy for (tool, action),
-    gates as needed, then calls TOOL_DISPATCH[tool] under its contract's
-    timeout and checks its postcondition (if one is registered — see
-    core/postconditions.py). Never call this from the audio/transcript
-    thread — same rule as CONFIRM.request().
+    """Validates input, evaluates permission_policy for (tool, action,
+    caller_class), gates as needed, then calls TOOL_DISPATCH[tool] under
+    its contract's timeout and checks its postcondition (if one is
+    registered — see core/postconditions.py). Never call this from the
+    audio/transcript thread — same rule as CONFIRM.request().
+
+    caller_class defaults to 'desktop' so every pre-existing call site
+    (main.py, agent/executor.py's _call_tool) behaves exactly as before
+    without needing to pass anything new yet — see core/policy.py's
+    get_policy_level() for how the two caller-class families (desktop vs.
+    service:*) differ once a service:* value is actually passed in (by
+    the future network boundary).
 
     Every path that actually invokes the tool (delegated, auto-allow,
     notify-only, ask-and-wait-approved) funnels through the single
@@ -313,12 +374,17 @@ def dispatch_tool(
 
     contract = get_contract(tool)
     action   = _extract_action(tool, args)
-    level    = get_policy_level(tool, action)
+    level    = get_policy_level(tool, action, caller_class)
 
     validation_error = validate_input(tool, args, contract.input_schema)
     if validation_error:
         _log_decision(tool, action, level, "rejected", task_id)
         return f"Rejected — '{tool}' parameters are invalid: {validation_error}"
+
+    path_scope_error = _validate_service_path_scope(tool, args, caller_class)
+    if path_scope_error:
+        _log_decision(tool, action, level, "rejected", task_id)
+        return f"Rejected — '{tool}' {path_scope_error}"
 
     should_invoke = True
     notify_after  = False

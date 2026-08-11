@@ -3,17 +3,43 @@ core/policy.py
 ================
 The permission_policy table: which of the four levels — auto-allow,
 notify-only, ask-and-wait, hard-deny — applies to each TOOL_DISPATCH tool,
-optionally overridden per action for tools whose action set spans a real
-risk range.
+per caller_class, optionally overridden per action for tools whose action
+set spans a real risk range.
 
 `action=None` is a tool's default row, used when no more specific
-(tool_name, action) row matches the action actually invoked. hard-deny has
-no rows in this phase — hooked up for a future need, not forced onto
-anything now.
+(tool_name, action, caller_class) row matches the action actually invoked.
+
+Two caller-class models, not one (see get_policy_level()'s docstring for
+the fallback each uses when no row matches at all):
+  - 'desktop' (the local PyQt6 client — DEFAULT_POLICY below): unlisted
+    tool falls back to ask-and-wait. hard-deny has no rows in this phase
+    for desktop — hooked up for a future need, not forced onto anything
+    now. Unchanged from before the headless-extraction phase — every
+    existing desktop row and lookup behavior stays exactly as it was.
+  - 'service:<name>' (SERVICE_POLICY below, one of the four backend-agent
+    classes calling in over the future network boundary — see
+    core/proactive.py-style module docs for the extraction-phase
+    context): default-deny, explicit allow-list up. A class with no row
+    for a given tool has never been granted it, not merely left
+    unconfigured — the opposite fallback direction from desktop.
 
 Where a tool's action set wasn't explicitly enumerated in the resolved
 policy, the classification below is this module's own best-effort split
 (documented inline) — flagged to the user rather than silently assumed.
+
+DELEGATED_TOOLS caveat (dev_agent, vision_fix_code): core/tool_gate.py's
+dispatch_tool() checks `tool in DELEGATED_TOOLS` *before* it ever
+evaluates a permission_policy level — see that module's docstring. That
+means a SERVICE_POLICY row for either tool is NOT what actually gates
+access for a service:* caller; it's effectively a no-op at the
+policy-table level regardless of what it says. The real protection for
+any caller with no live UI (every service:* class, and today's own
+background task queue) is core/confirm.py's CONFIRM.request(): it fails
+closed unconditionally whenever `player is None`, which is always true
+off the desktop UI thread. This is a structural gap in the same family as
+the agent_task one (see core/proactive.py's Step 1.2b-equivalent
+investigation) — flagged here, not silently paved over by pretending the
+policy row is the enforcement point.
 """
 from __future__ import annotations
 
@@ -31,7 +57,19 @@ HARD_DENY    = "hard-deny"
 
 LEVELS = {AUTO_ALLOW, NOTIFY_ONLY, ASK_AND_WAIT, HARD_DENY}
 
+DESKTOP              = "desktop"
+SERVICE_SUPPORT      = "service:support"
+SERVICE_BUGFIX       = "service:bugfix"
+SERVICE_PROMOTIONS   = "service:promotions"
+SERVICE_PERSONAL     = "service:personal"
+
+CALLER_CLASSES = {DESKTOP, SERVICE_SUPPORT, SERVICE_BUGFIX, SERVICE_PROMOTIONS, SERVICE_PERSONAL}
+SERVICE_CALLER_CLASSES = CALLER_CLASSES - {DESKTOP}
+
 # (tool_name, action, level) — action=None is the tool-wide default row.
+# Desktop's rows only — seeded with caller_class='desktop' by
+# seed_default_policy(). Unchanged from before the headless-extraction
+# phase.
 DEFAULT_POLICY: list[tuple[str, str | None, str]] = [
     # ── auto-allow — read-only / no meaningful side effect ──────────────────
     ("weather_report", None, AUTO_ALLOW),
@@ -125,42 +163,115 @@ DEFAULT_POLICY: list[tuple[str, str | None, str]] = [
     # ── hard-deny — no rows assigned in this phase ──────────────────────────
 ]
 
+# caller_class -> [(tool_name, action, level), ...] — each service
+# class's explicit allow-list. Everything NOT listed here falls to
+# get_policy_level()'s hard-deny default for service:* callers (see this
+# module's docstring) — absence from this list is a real, intentional
+# denial, not an oversight to fix later.
+#
+# Every row here is ask-and-wait, deliberately more conservative than
+# just inheriting desktop's level for the same tool (e.g. file_processor
+# defaults to notify-only for desktop — proceeds, user told after the
+# fact — which is the wrong shape for a caller with no live human present
+# to be told anything). A new, less-trusted caller class starting at the
+# strictest gate available and being loosened later with a specific
+# reason beats starting loose. This wasn't spelled out as a numeric
+# level in the phase-1 plan, so it's flagged here as a deliberate choice,
+# not a silent default.
+#
+# agent_task is deliberately absent from every list below and cannot be
+# added here at all today — it doesn't go through dispatch_tool()/
+# permission_policy in the first place (see main.py's _execute_tool()
+# special case). Gated separately, unconditionally hard-denied for every
+# service:* class regardless of this table — see the agent_task-gap
+# investigation (core/proactive.py's Step-1.2b-equivalent commit).
+SERVICE_POLICY: dict[str, list[tuple[str, str | None, str]]] = {
+    SERVICE_BUGFIX: [
+        ("code_helper",     None, ASK_AND_WAIT),
+        # dev_agent / vision_fix_code: allow-listed per the phase-1 plan,
+        # but see this module's docstring — DELEGATED_TOOLS bypasses this
+        # row entirely at dispatch_tool(). The row is kept here for
+        # completeness/documentation of intent, not because it's what
+        # actually gates these two for this class.
+        ("dev_agent",       None, ASK_AND_WAIT),
+        ("vision_fix_code", None, ASK_AND_WAIT),
+        ("file_processor",  None, ASK_AND_WAIT),
+        # file_controller: additionally scoped to project directories
+        # only for this caller class — see core/tool_gate.py's
+        # SERVICE_PATH_SCOPED_TOOLS / _validate_service_path_scope().
+        # The policy row alone only gets the tool past the *permission*
+        # gate; the path-prefix check is a separate, additional
+        # validation step, same relationship file_controller's own
+        # existing _is_safe_path()/_SAFE_ROOTS has to desktop callers.
+        ("file_controller", None, ASK_AND_WAIT),
+    ],
+    # service:support: support_agent_service.py's own 5-tool registry
+    # (lookup_user_trips, lookup_booking, get_refund_policy,
+    # escalate_to_human, create_or_append_ticket) is entirely
+    # EYV-internal — confirmed zero overlap with TOOL_DISPATCH. Nothing
+    # to allow here; every Hermes tool falls to the hard-deny default.
+    SERVICE_SUPPORT: [],
+    # service:promotions: EYV's own analytics API already covers this
+    # agent's needs. Nothing to allow here.
+    SERVICE_PROMOTIONS: [],
+    SERVICE_PERSONAL: [
+        ("reminder",       None, ASK_AND_WAIT),
+        ("file_processor", None, ASK_AND_WAIT),
+        # web_search / flight_finder: open scope question per the phase-1
+        # plan — deliberately left out, not decided silently either way.
+    ],
+}
+
 _seed_lock = threading.Lock()
 _seeded    = False
 
 
+def _row_exists(conn, tool_name: str, action: str | None, caller_class: str) -> bool:
+    if action is None:
+        return conn.execute(
+            "SELECT 1 FROM permission_policy WHERE tool_name = ? AND action IS NULL AND caller_class = ?",
+            (tool_name, caller_class),
+        ).fetchone() is not None
+    return conn.execute(
+        "SELECT 1 FROM permission_policy WHERE tool_name = ? AND action = ? AND caller_class = ?",
+        (tool_name, action, caller_class),
+    ).fetchone() is not None
+
+
 def seed_default_policy() -> None:
-    """Inserts any DEFAULT_POLICY row not already present — additive, not a
-    one-shot "only if the table is empty" gate. A row-count gate would mean
-    a tool added to DEFAULT_POLICY after a deployment's first run (like
+    """Inserts any DEFAULT_POLICY (caller_class='desktop') or
+    SERVICE_POLICY row not already present — additive, not a one-shot
+    "only if the table is empty" gate. A row-count gate would mean a tool
+    added to either policy list after a deployment's first run (like
     'reminder', missed in the original pass and added later) would never
     get seeded on existing installs, silently falling back to
-    get_policy_level()'s ask-and-wait default forever instead of the
-    intended row. Checked per-row rather than relying on a UNIQUE
-    constraint because SQLite doesn't dedupe NULL in (tool_name, action) —
-    see core/db.py's permission_policy comment. Table stays small (order
-    of DEFAULT_POLICY's length), so a SELECT per candidate row is cheap."""
+    get_policy_level()'s own default forever instead of the intended row.
+    Checked per-row rather than relying on a UNIQUE constraint because
+    SQLite doesn't dedupe NULL in (tool_name, action, caller_class) — see
+    core/db.py's permission_policy comment. Table stays small (order of
+    DEFAULT_POLICY's + SERVICE_POLICY's combined length), so a SELECT per
+    candidate row is cheap."""
     conn = get_conn()
     added = 0
     with conn:
         for tool_name, action, level in DEFAULT_POLICY:
-            if action is None:
-                exists = conn.execute(
-                    "SELECT 1 FROM permission_policy WHERE tool_name = ? AND action IS NULL",
-                    (tool_name,),
-                ).fetchone()
-            else:
-                exists = conn.execute(
-                    "SELECT 1 FROM permission_policy WHERE tool_name = ? AND action = ?",
-                    (tool_name, action),
-                ).fetchone()
-            if exists:
+            if _row_exists(conn, tool_name, action, DESKTOP):
                 continue
             conn.execute(
-                "INSERT INTO permission_policy (tool_name, action, level) VALUES (?, ?, ?)",
-                (tool_name, action, level),
+                "INSERT INTO permission_policy (tool_name, action, level, caller_class) VALUES (?, ?, ?, ?)",
+                (tool_name, action, level, DESKTOP),
             )
             added += 1
+
+        for caller_class, rows in SERVICE_POLICY.items():
+            for tool_name, action, level in rows:
+                if _row_exists(conn, tool_name, action, caller_class):
+                    continue
+                conn.execute(
+                    "INSERT INTO permission_policy (tool_name, action, level, caller_class) VALUES (?, ?, ?, ?)",
+                    (tool_name, action, level, caller_class),
+                )
+                added += 1
     if added:
         _log.info("Seeded %d new permission_policy row(s).", added)
 
@@ -176,24 +287,35 @@ def _ensure_seeded() -> None:
         _seeded = True
 
 
-def get_policy_level(tool_name: str, action: str | None) -> str:
-    """Most specific match wins: (tool_name, action) row if one exists,
-    else the tool's (tool_name, NULL) default row, else ask-and-wait —
-    an unlisted tool fails toward asking, not toward auto-allow."""
+def get_policy_level(tool_name: str, action: str | None, caller_class: str = DESKTOP) -> str:
+    """Most specific match wins: (tool_name, action, caller_class) row if
+    one exists, else the tool's (tool_name, NULL, caller_class) default
+    row, else a caller-class-dependent fallback:
+      - 'desktop': ask-and-wait — an unlisted tool fails toward asking,
+        not toward auto-allow. Exact pre-existing behavior, unchanged.
+      - any 'service:*' class: hard-deny — default-deny, explicit
+        allow-list up (see SERVICE_POLICY / this module's docstring). A
+        tool with no row for this caller class was never granted it, not
+        merely left unconfigured.
+    `caller_class` defaults to 'desktop' so every pre-existing call site
+    (main.py, agent/executor.py's _call_tool) keeps behaving exactly as
+    before without needing to change yet."""
     _ensure_seeded()
     conn = get_conn()
     if action:
         row = conn.execute(
-            "SELECT level FROM permission_policy WHERE tool_name = ? AND action = ?",
-            (tool_name, action),
+            "SELECT level FROM permission_policy WHERE tool_name = ? AND action = ? AND caller_class = ?",
+            (tool_name, action, caller_class),
         ).fetchone()
         if row:
             return row["level"]
     row = conn.execute(
-        "SELECT level FROM permission_policy WHERE tool_name = ? AND action IS NULL",
-        (tool_name,),
+        "SELECT level FROM permission_policy WHERE tool_name = ? AND action IS NULL AND caller_class = ?",
+        (tool_name, caller_class),
     ).fetchone()
-    return row["level"] if row else ASK_AND_WAIT
+    if row:
+        return row["level"]
+    return ASK_AND_WAIT if caller_class == DESKTOP else HARD_DENY
 
 
 def _truthy(v) -> bool:

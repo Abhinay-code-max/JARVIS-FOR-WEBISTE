@@ -25,16 +25,16 @@ core/policy.py's SERVICE_POLICY docstring) rather than through the
 HTTP-layer gate that would otherwise make this scenario untestable
 without contradicting Step 1.2b's own, already-verified restriction.
 
-Separate, real finding flagged here rather than silently fixed (out of
-this step's stated scope): api/hermes_app.py's POST /approvals/{id}
-endpoint has no caller_class restriction at all today — ANY
-authenticated caller (including service:promotions, whose tool
-allow-list is empty) can resolve ANY pending approval, including one
-belonging to a different caller's task. Whether approval resolution
-should be scoped to specific caller classes (e.g. desktop-only, or
-only the submitting caller_class) is an open question this step didn't
-ask to resolve, but is worth deciding before this boundary goes beyond
-localhost.
+Step 1.6b (see ApprovalResolutionAuthTest below): a related finding from
+this file's own first pass was that POST /approvals/{id} had no
+caller_class restriction at all — ANY authenticated caller (including
+service:promotions, whose tool allow-list is empty) could resolve ANY
+pending approval, including one belonging to a different caller's task.
+Fixed there: only 'desktop' may resolve an approval, regardless of which
+caller_class the underlying task was triggered by, enforced as its own
+router-level dependency (api/hermes_app.py's
+approval_resolution_router/_require_desktop_caller) rather than a
+per-route check.
 
 Safety note, worth stating explicitly because it's the one way this
 specific test class can go wrong in a way that's easy to miss locally
@@ -275,6 +275,115 @@ class ApprovalRoutingTest(HermesApiTestCase):
 
         status = self._wait_for_task(task_id, timeout=5.0)
         self.assertEqual(status["status"], "completed", status)
+
+
+class ApprovalResolutionAuthTest(ApprovalRoutingTest):
+    """Step 1.6b: an approval can only be resolved by the desktop
+    caller_class, regardless of which caller_class triggered the
+    underlying task. Subclasses ApprovalRoutingTest to reuse its
+    _submit_ask_and_wait_step()/_find_pending_approval() helpers rather
+    than reinventing them."""
+
+    def test_service_support_cannot_resolve_a_service_bugfix_triggered_approval(self):
+        orig_tool = tdisp.TOOL_DISPATCH.get("code_helper")
+        tdisp.TOOL_DISPATCH["code_helper"] = lambda args, player, speak: "SHOULD NEVER RUN — WRONG CALLER RESOLVED IT"
+
+        task_id  = self._submit_ask_and_wait_step(policy.SERVICE_BUGFIX, "code_helper", {"action": "run", "file_path": "x.py"})
+        approval = self._find_pending_approval(task_id)
+        support_token = hermes_auth_mint(policy.SERVICE_SUPPORT)
+        try:
+            self.assertIsNotNone(approval)
+
+            r = self.client.post(
+                f"/approvals/{approval['approval_id']}", json={"approve": True},
+                headers={"Authorization": f"Bearer {support_token}"},
+            )
+            # Expected: rejected — service:support is not the desktop
+            # caller, even though it authenticated correctly and even
+            # though it isn't the caller_class that triggered this task
+            # either way (neither fact should matter — only 'desktop' can
+            # ever resolve an approval).
+            self.assertEqual(r.status_code, 403, r.text)
+
+            # And the approval must still genuinely be pending — the
+            # rejected request must not have silently resolved it anyway.
+            still_pending = any(
+                p["approval_id"] == approval["approval_id"] for p in ta_mod.TASK_APPROVAL.list_pending()
+            )
+            self.assertTrue(still_pending, "approval was resolved despite the 403")
+        finally:
+            if approval is not None:
+                ta_mod.TASK_APPROVAL.answer(approval["approval_id"], approve=True)
+            if orig_tool is not None:
+                tdisp.TOOL_DISPATCH["code_helper"] = orig_tool
+
+        # Cleaned up via the real desktop-equivalent primitive above —
+        # the task itself still completes normally once actually resolved.
+        status = self._wait_for_task(task_id, timeout=5.0)
+        self.assertEqual(status["status"], "completed", status)
+
+    def test_desktop_can_still_resolve_any_approval_regardless_of_triggering_caller(self):
+        """Contrast case: the fix must not accidentally scope resolution
+        to 'only the same caller_class that submitted the task' — the
+        plan is explicit that desktop resolves everything, unconditionally."""
+        orig_tool = tdisp.TOOL_DISPATCH.get("code_helper")
+        tdisp.TOOL_DISPATCH["code_helper"] = lambda args, player, speak: "ran"
+
+        task_id  = self._submit_ask_and_wait_step(policy.SERVICE_BUGFIX, "code_helper", {"action": "run", "file_path": "x.py"})
+        approval = self._find_pending_approval(task_id)
+        desktop_token = hermes_auth_mint(policy.DESKTOP)
+        try:
+            self.assertIsNotNone(approval)
+            r = self.client.post(
+                f"/approvals/{approval['approval_id']}", json={"approve": True},
+                headers={"Authorization": f"Bearer {desktop_token}"},
+            )
+            self.assertEqual(r.status_code, 200, r.text)
+            approval = None
+        finally:
+            if approval is not None:
+                ta_mod.TASK_APPROVAL.answer(approval["approval_id"], approve=True)
+            if orig_tool is not None:
+                tdisp.TOOL_DISPATCH["code_helper"] = orig_tool
+
+        status = self._wait_for_task(task_id, timeout=5.0)
+        self.assertEqual(status["status"], "completed", status)
+
+    def test_every_non_desktop_caller_class_is_rejected(self):
+        orig_tool = tdisp.TOOL_DISPATCH.get("code_helper")
+        tdisp.TOOL_DISPATCH["code_helper"] = lambda args, player, speak: "SHOULD NEVER RUN"
+
+        task_id  = self._submit_ask_and_wait_step(policy.SERVICE_BUGFIX, "code_helper", {"action": "run", "file_path": "x.py"})
+        approval = self._find_pending_approval(task_id)
+        try:
+            self.assertIsNotNone(approval)
+            for caller_class in policy.SERVICE_CALLER_CLASSES:
+                token = hermes_auth_mint(caller_class)
+                r = self.client.post(
+                    f"/approvals/{approval['approval_id']}", json={"approve": True},
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                self.assertEqual(r.status_code, 403, f"{caller_class} was allowed to resolve an approval: {r.text}")
+        finally:
+            if approval is not None:
+                ta_mod.TASK_APPROVAL.answer(approval["approval_id"], approve=True)
+            if orig_tool is not None:
+                tdisp.TOOL_DISPATCH["code_helper"] = orig_tool
+
+        status = self._wait_for_task(task_id, timeout=5.0)
+        self.assertEqual(status["status"], "completed", status)
+
+    def test_no_route_reachable_without_auth_still_covers_the_new_router(self):
+        """Structural check mirroring
+        tests/test_hermes_api.py's AuthRejectionTest — the new
+        approval_resolution_router must still reject a completely
+        unauthenticated request (401), before ever reaching the
+        desktop-only check (403) — the two dependencies must be layered
+        in the right order, not the desktop check accidentally running
+        (and maybe passing/failing oddly) before auth itself."""
+        import api.hermes_app as hermes_app
+        r = self.client.post("/approvals/1", json={"approve": True})
+        self.assertEqual(r.status_code, 401)
 
 
 def hermes_auth_mint(caller_class: str) -> str:

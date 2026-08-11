@@ -61,7 +61,11 @@ for what's still needed, not silently declared finished):
                             'desktop' can today, per Step 1.2b)
   GET  /tasks/{task_id}     status
   GET  /approvals           list pending ask-and-wait approvals
-  POST /approvals/{id}      resolve one (approve/deny)
+  POST /approvals/{id}      resolve one (approve/deny) — desktop caller
+                            only, regardless of who triggered the
+                            underlying task (Step 1.6b) — GET /approvals
+                            (listing) is not similarly restricted, a
+                            deliberate scope boundary, not an oversight
   GET  /memory              read-only snapshot (memory *write* semantics
                             over this boundary — which caller_class can
                             write which categories, if any — is an open
@@ -188,6 +192,29 @@ async def _authenticate(request: Request) -> str:
     return caller_class
 
 
+async def _require_desktop_caller(request: Request) -> None:
+    """Additional router-level dependency for approval-*resolution*
+    routes specifically (Step 1.6b) — an approval may only be resolved
+    by the 'desktop' caller_class, regardless of which caller_class
+    triggered the underlying task. This matches the approval-routing
+    design locked in during Step 1.6: a single human-approval channel,
+    not one whose trust forks by caller_class. Without this, once a
+    second live token exists (Step 1.8), a service:support caller
+    (empty tool allow-list — the least-trusted class by design) could
+    resolve a service:bugfix task's pending approval, which would make
+    the human-approval gate meaningless the moment that second token
+    goes live.
+
+    Runs after _authenticate (which resolves request.state.caller_class)
+    — see approval_resolution_router below, where both are listed as
+    router-level dependencies together, so any future route registered
+    on that router gets this enforced structurally, not as a per-route
+    check an endpoint author could forget to add."""
+    caller_class = getattr(request.state, "caller_class", None)
+    if caller_class != DESKTOP:
+        raise HTTPException(status_code=403, detail="only the desktop caller may resolve approvals")
+
+
 # ---------------------------------------------------------------------------
 # Audited route class — every REST request logged structurally, not via
 # a decorator an individual endpoint author could forget to add.
@@ -224,6 +251,18 @@ class AuditedRoute(APIRoute):
 
 
 rest_router = APIRouter(route_class=AuditedRoute, dependencies=[Depends(_authenticate)])
+
+# Separate router, not a per-route dependency added inline on
+# resolve_approval — see _require_desktop_caller's own docstring for why
+# this needs to be structural rather than something a future
+# approval-resolution route could forget to repeat. _authenticate is
+# listed again here (routers don't inherit sibling routers'
+# dependencies) — order matters: it must resolve request.state.caller_class
+# before _require_desktop_caller reads it.
+approval_resolution_router = APIRouter(
+    route_class=AuditedRoute,
+    dependencies=[Depends(_authenticate), Depends(_require_desktop_caller)],
+)
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +303,7 @@ async def list_approvals():
     return TASK_APPROVAL.list_pending()
 
 
-@rest_router.post("/approvals/{approval_id}")
+@approval_resolution_router.post("/approvals/{approval_id}")
 async def resolve_approval(approval_id: int, body: dict):
     approve = bool(body.get("approve", True))
     ok = TASK_APPROVAL.answer(approval_id, approve)
@@ -349,6 +388,7 @@ def create_app() -> FastAPI:
     tests/test_hermes_api.py)."""
     app = FastAPI(title="Hermes — JARVIS-XL network boundary")
     app.include_router(rest_router)
+    app.include_router(approval_resolution_router)
     app.add_api_websocket_route("/ws", hermes_websocket)
     return app
 

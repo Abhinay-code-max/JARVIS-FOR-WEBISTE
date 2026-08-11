@@ -1,18 +1,22 @@
 """
 tests/test_proactive.py
 ========================
-Phase-1 proactive nudges (core/proactive.py): the three trigger types, the
+Phase-1 proactive nudges (core/proactive.py): the four trigger types, the
 speaking/muted/quiet-hours gate, and the dedup story for each trigger
-(durable table for failed tasks and calendar events, in-memory-only for
-stale approvals — see core/db.py's proactive_nudges schema comment for
-why they differ).
+(durable table for failed tasks, calendar events, and CI runs;
+in-memory-only for stale approvals — see core/db.py's proactive_nudges
+schema comment for why they differ).
 
 The calendar trigger's tests never import the real google-* packages
 (not installed in this environment, matching most real installs that
 haven't opted into calendar_enabled) — core.calendar_auth is stood in
 for via sys.modules patching, since core/proactive.py's `from core import
 calendar_auth` is a lazy, function-local import specifically so a
-missing/failing calendar_auth can never break the other two triggers.
+missing/failing calendar_auth can never break the other triggers. The CI
+trigger's tests use the same sys.modules-patching approach for
+core.github_ci_auth (also a lazy, function-local import), but `requests`
+itself IS a real installed dependency here, so its tests patch
+`requests.get` directly rather than needing a whole fake module.
 
 Redirects core.db at a fresh temp sqlite file, same pattern as the other
 test modules in this package, so nothing here touches data/jarvis.db.
@@ -143,6 +147,68 @@ def _fake_calendar_auth_module(service) -> types.ModuleType:
     instead of the real (google-* dependent) module."""
     fake = types.ModuleType("core.calendar_auth")
     fake.get_calendar_service = lambda: service
+    return fake
+
+
+def _insert_cached_ci_run(
+    run_id: int, repo: str | None = None, workflow: str = "CI",
+    title: str = "Fix login bug", branch: str = "main", sha: str = "abc123",
+    status: str = "completed", conclusion: str | None = "success",
+):
+    """Writes directly into ci_runs_cache — bypasses _sync_ci() entirely,
+    so trigger-logic tests (filters, dedup, grouping) don't need a fake
+    GitHub API response at all."""
+    conn = db.get_conn()
+    with conn:
+        conn.execute(
+            "INSERT INTO ci_runs_cache "
+            "(run_id, repo, workflow, title, branch, sha, status, conclusion, html_url, synced_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                run_id, repo or proactive.CI_REPOS[0], workflow, title, branch, sha,
+                status, conclusion, f"https://github.com/{repo or proactive.CI_REPOS[0]}/actions/runs/{run_id}",
+                time.time(),
+            ),
+        )
+
+
+def _github_run(
+    run_id: int, workflow: str = "CI", title: str = "Fix login bug",
+    branch: str = "main", sha: str = "abc123",
+    status: str = "completed", conclusion: str | None = "success",
+) -> dict:
+    """One raw 'list workflow runs' item, in GitHub's own response shape
+    — for _sync_ci()/_parse_ci_run() tests only."""
+    return {
+        "id": run_id, "name": workflow, "display_title": title,
+        "head_branch": branch, "head_sha": sha,
+        "status": status, "conclusion": conclusion,
+        "html_url": f"https://github.com/x/y/actions/runs/{run_id}",
+    }
+
+
+class _FakeGithubResponse:
+    """Mimics requests.Response just enough for _sync_ci()'s tests —
+    .raise_for_status()/.json(), no real HTTP involved."""
+
+    def __init__(self, json_data=None, error=None):
+        self._json_data = json_data or {}
+        self._error     = error
+
+    def raise_for_status(self):
+        if self._error:
+            raise self._error
+
+    def json(self):
+        return self._json_data
+
+
+def _fake_github_ci_auth_module(token) -> types.ModuleType:
+    """A stand-in for core.github_ci_auth, registered into sys.modules so
+    core/proactive.py's lazy `from core import github_ci_auth` picks it
+    up instead of the real module."""
+    fake = types.ModuleType("core.github_ci_auth")
+    fake.get_github_token = lambda: token
     return fake
 
 
@@ -513,6 +579,344 @@ class CalendarTriggerTest(ProactiveTestCase):
         self.assertFalse(db.nudge_already_sent(proactive.TRIGGER_CALENDAR_EVENT, "e1"))
 
 
+class ParseCiRunTest(unittest.TestCase):
+    def test_parses_all_expected_fields(self):
+        item   = _github_run(101, workflow="Build", title="Fix flaky test", branch="main", sha="deadbeef")
+        parsed = proactive._parse_ci_run(item)
+        self.assertEqual(parsed["run_id"], 101)
+        self.assertEqual(parsed["workflow"], "Build")
+        self.assertEqual(parsed["title"], "Fix flaky test")
+        self.assertEqual(parsed["branch"], "main")
+        self.assertEqual(parsed["sha"], "deadbeef")
+        self.assertEqual(parsed["status"], "completed")
+        self.assertEqual(parsed["conclusion"], "success")
+
+    def test_missing_name_falls_back_to_placeholder(self):
+        item = _github_run(102)
+        del item["name"]
+        parsed = proactive._parse_ci_run(item)
+        self.assertEqual(parsed["workflow"], "(unnamed workflow)")
+
+    def test_in_progress_run_has_null_conclusion(self):
+        item   = _github_run(103, status="in_progress", conclusion=None)
+        parsed = proactive._parse_ci_run(item)
+        self.assertEqual(parsed["status"], "in_progress")
+        self.assertIsNone(parsed["conclusion"])
+
+
+class SyncCiTest(ProactiveTestCase):
+    def test_disabled_by_default_never_touches_requests_or_github_ci_auth(self):
+        """github_ci_enabled defaults to unset/False — _sync_ci() must
+        return before even calling requests.get. Proven with a
+        raising side effect: if it were ever called, this test would
+        fail with that exception instead of passing quietly."""
+        with patch("requests.get", side_effect=AssertionError("must not be called")):
+            loop = _RecordingLoop()
+            loop._sync_ci()
+        self.assertEqual(db.get_cached_ci_runs(), [])
+
+    def test_enabled_populates_cache_from_api_response_for_both_repos(self):
+        cfg       = {"github_ci_enabled": True}
+        fake_auth = _fake_github_ci_auth_module("fake-token")
+        repo_a, repo_b = proactive.CI_REPOS
+
+        def _fake_get(url, headers=None, params=None, timeout=None):
+            if repo_a in url:
+                return _FakeGithubResponse({"workflow_runs": [_github_run(1)]})
+            if repo_b in url:
+                return _FakeGithubResponse({"workflow_runs": [_github_run(2)]})
+            raise AssertionError(f"unexpected URL: {url}")
+
+        with patch.dict(sys.modules, {"core.github_ci_auth": fake_auth}), \
+             patch.object(proactive, "load_config", lambda: cfg), \
+             patch("requests.get", side_effect=_fake_get):
+            _RecordingLoop()._sync_ci()
+
+        cached = {r["run_id"]: r["repo"] for r in db.get_cached_ci_runs()}
+        self.assertEqual(cached, {1: repo_a, 2: repo_b})
+
+    def test_request_headers_carry_bearer_token_and_api_version(self):
+        cfg       = {"github_ci_enabled": True}
+        fake_auth = _fake_github_ci_auth_module("secret-token-123")
+        seen_headers = []
+
+        def _fake_get(url, headers=None, params=None, timeout=None):
+            seen_headers.append(headers)
+            return _FakeGithubResponse({"workflow_runs": []})
+
+        with patch.dict(sys.modules, {"core.github_ci_auth": fake_auth}), \
+             patch.object(proactive, "load_config", lambda: cfg), \
+             patch("requests.get", side_effect=_fake_get):
+            _RecordingLoop()._sync_ci()
+
+        self.assertEqual(len(seen_headers), 2)  # one call per watched repo
+        for headers in seen_headers:
+            self.assertEqual(headers["Authorization"], "Bearer secret-token-123")
+            self.assertEqual(headers["X-GitHub-Api-Version"], proactive._GITHUB_API_VERSION)
+
+    def test_not_yet_authorized_leaves_cache_empty(self):
+        cfg       = {"github_ci_enabled": True}
+        fake_auth = _fake_github_ci_auth_module(None)
+
+        with patch.dict(sys.modules, {"core.github_ci_auth": fake_auth}), \
+             patch.object(proactive, "load_config", lambda: cfg), \
+             patch("requests.get", side_effect=AssertionError("must not be called")):
+            _RecordingLoop()._sync_ci()  # must not raise
+
+        self.assertEqual(db.get_cached_ci_runs(), [])
+
+    def test_get_github_token_raising_does_not_crash_sync(self):
+        cfg  = {"github_ci_enabled": True}
+        fake = types.ModuleType("core.github_ci_auth")
+
+        def _raise():
+            raise RuntimeError("token file corrupted")
+
+        fake.get_github_token = _raise
+
+        with patch.dict(sys.modules, {"core.github_ci_auth": fake}), \
+             patch.object(proactive, "load_config", lambda: cfg):
+            _RecordingLoop()._sync_ci()  # must not raise
+
+        self.assertEqual(db.get_cached_ci_runs(), [])
+
+    def test_one_repo_failing_does_not_wipe_the_other_repos_cache(self):
+        """The resilience guarantee, specific to CI's per-repo scoping:
+        repo A's sync failing must not touch repo B's already-cached
+        rows — unlike calendar's single-source full-table replace, this
+        table holds two independent sources, and replace_ci_cache() only
+        ever deletes the one repo it's given."""
+        cfg       = {"github_ci_enabled": True}
+        fake_auth = _fake_github_ci_auth_module("fake-token")
+        repo_a, repo_b = proactive.CI_REPOS
+
+        def _good_get(url, headers=None, params=None, timeout=None):
+            if repo_a in url:
+                return _FakeGithubResponse({"workflow_runs": [_github_run(1)]})
+            return _FakeGithubResponse({"workflow_runs": [_github_run(2)]})
+
+        with patch.dict(sys.modules, {"core.github_ci_auth": fake_auth}), \
+             patch.object(proactive, "load_config", lambda: cfg), \
+             patch("requests.get", side_effect=_good_get):
+            _RecordingLoop()._sync_ci()
+
+        cached = {r["run_id"]: r["repo"] for r in db.get_cached_ci_runs()}
+        self.assertEqual(cached, {1: repo_a, 2: repo_b})
+
+        def _mixed_get(url, headers=None, params=None, timeout=None):
+            if repo_a in url:
+                raise ConnectionError("network down")
+            return _FakeGithubResponse({"workflow_runs": [_github_run(3)]})
+
+        with patch.dict(sys.modules, {"core.github_ci_auth": fake_auth}), \
+             patch.object(proactive, "load_config", lambda: cfg), \
+             patch("requests.get", side_effect=_mixed_get):
+            _RecordingLoop()._sync_ci()  # must not raise
+
+        cached = {r["run_id"]: r["repo"] for r in db.get_cached_ci_runs()}
+        # repo_a's row from the first (successful) sync must survive
+        # untouched — this cycle's failure for repo_a didn't delete it.
+        self.assertEqual(cached.get(1), repo_a)
+        # repo_b's cache DID get replaced (run 2 -> run 3), proving
+        # repo_a's failure didn't somehow also block repo_b's own sync.
+        self.assertNotIn(2, cached)
+        self.assertEqual(cached.get(3), repo_b)
+
+    def test_tick_survives_an_unexpected_exception_inside_sync_ci(self):
+        """Defense in depth beyond _sync_ci()'s own try/excepts: even if
+        it somehow raised anyway, _tick()'s own wrapper must keep the
+        other three triggers running unaffected."""
+        cfg = {"github_ci_enabled": True}
+        _insert_task("t1", "failed", error="x", goal="y")
+
+        class ExplodingLoop(_RecordingLoop):
+            def _sync_ci(self):
+                raise RuntimeError("boom")
+
+        with patch.object(proactive, "load_config", lambda: cfg):
+            loop = ExplodingLoop()
+            loop._tick()  # must not raise
+
+        self.assertEqual(len(loop.spoken), 1)
+        self.assertIn("y", loop.spoken[0])
+
+
+class CiRunTriggerTest(ProactiveTestCase):
+    def test_completed_failure_nudges_with_workflow_title_and_repo(self):
+        _insert_cached_ci_run(1, workflow="Tests", title="Fix login bug", conclusion="failure")
+        loop = _RecordingLoop()
+        loop._check_ci_runs()
+        self.assertEqual(len(loop.spoken), 1)
+        msg = loop.spoken[0]
+        self.assertIn("Tests", msg)
+        self.assertIn("failed", msg)
+        self.assertIn("Fix login bug", msg)
+        self.assertIn(proactive.CI_REPOS[0], msg)
+
+    def test_completed_success_nudges_with_flat_non_celebratory_register(self):
+        _insert_cached_ci_run(1, workflow="Tests", title="Fix login bug", conclusion="success")
+        loop = _RecordingLoop()
+        loop._check_ci_runs()
+        self.assertEqual(len(loop.spoken), 1)
+        msg = loop.spoken[0]
+        self.assertIn("Tests", msg)
+        self.assertIn("passed", msg)
+        self.assertNotIn("!", msg)  # no celebratory framing, matches every other trigger's tone
+
+    def test_in_progress_run_does_not_nudge(self):
+        _insert_cached_ci_run(1, status="in_progress", conclusion=None)
+        loop = _RecordingLoop()
+        loop._check_ci_runs()
+        self.assertEqual(loop.spoken, [])
+
+    def test_queued_run_does_not_nudge(self):
+        _insert_cached_ci_run(1, status="queued", conclusion=None)
+        loop = _RecordingLoop()
+        loop._check_ci_runs()
+        self.assertEqual(loop.spoken, [])
+
+    def test_cancelled_conclusion_does_not_nudge(self):
+        """Only success/failure are nudge-worthy conclusions, per the
+        plan — cancelled/skipped/timed_out/etc. are cached but silent."""
+        _insert_cached_ci_run(1, status="completed", conclusion="cancelled")
+        loop = _RecordingLoop()
+        loop._check_ci_runs()
+        self.assertEqual(loop.spoken, [])
+
+    def test_second_check_does_not_renudge_the_same_run_same_conclusion(self):
+        _insert_cached_ci_run(1, conclusion="failure")
+        loop = _RecordingLoop()
+        loop._check_ci_runs()
+        loop._check_ci_runs()
+        self.assertEqual(len(loop.spoken), 1)
+
+    def test_dedup_is_durable_across_a_simulated_restart(self):
+        _insert_cached_ci_run(1, conclusion="failure")
+        first_run = _RecordingLoop()
+        first_run._check_ci_runs()
+        self.assertEqual(len(first_run.spoken), 1)
+
+        second_run = _RecordingLoop()   # fresh in-memory state, same db
+        second_run._check_ci_runs()
+        self.assertEqual(second_run.spoken, [])
+
+    def test_failure_then_later_success_on_the_same_run_id_both_nudge(self):
+        """The exact scenario named in the plan: GitHub's 're-run failed
+        jobs' reuses the same run_id and just updates its conclusion in
+        place. Dedup keyed on (run_id, conclusion) — not run_id alone —
+        must let the follow-up success through even though this run_id
+        was already nudged once, as a failure."""
+        _insert_cached_ci_run(1, workflow="Tests", conclusion="failure")
+        loop = _RecordingLoop()
+        loop._check_ci_runs()
+        self.assertEqual(len(loop.spoken), 1)
+        self.assertIn("failed", loop.spoken[0])
+
+        # Simulate the re-run's effect: same run_id, cache now reflects
+        # the new (successful) conclusion — exactly what a real
+        # _sync_ci() would produce once GitHub's own conclusion flips.
+        conn = db.get_conn()
+        with conn:
+            conn.execute("UPDATE ci_runs_cache SET conclusion = 'success' WHERE run_id = 1")
+
+        loop._check_ci_runs()
+        self.assertEqual(len(loop.spoken), 2, "the corrected success must still nudge, not be silently swallowed")
+        self.assertIn("passed", loop.spoken[1])
+
+        # And both dedup rows exist independently.
+        self.assertTrue(db.nudge_already_sent(proactive.TRIGGER_CI_RUN, "1:failure"))
+        self.assertTrue(db.nudge_already_sent(proactive.TRIGGER_CI_RUN, "1:success"))
+
+    def test_repeated_check_without_a_real_conclusion_change_does_not_renudge(self):
+        """Contrast case for the above: dedup must still hold when the
+        conclusion genuinely hasn't changed — this isn't 'always re-nudge
+        on re-check', only a real conclusion transition re-nudges."""
+        _insert_cached_ci_run(1, conclusion="failure")
+        loop = _RecordingLoop()
+        loop._check_ci_runs()
+        loop._check_ci_runs()  # conclusion unchanged — must not re-fire
+        self.assertEqual(len(loop.spoken), 1)
+
+    def test_two_runs_same_repo_and_sha_in_one_tick_are_grouped_into_one_nudge(self):
+        repo = proactive.CI_REPOS[0]
+        _insert_cached_ci_run(1, repo=repo, workflow="Lint", sha="abc123", conclusion="success")
+        _insert_cached_ci_run(2, repo=repo, workflow="Tests", sha="abc123", conclusion="failure")
+        loop = _RecordingLoop()
+        loop._check_ci_runs()
+        self.assertEqual(len(loop.spoken), 1, "expected one combined nudge, not one per run")
+        msg = loop.spoken[0]
+        self.assertIn("Lint passed", msg)
+        self.assertIn("Tests failed", msg)
+        self.assertIn(repo, msg)
+        # Both runs' dedup rows are recorded even though only one
+        # _gated_speak() call happened.
+        self.assertTrue(db.nudge_already_sent(proactive.TRIGGER_CI_RUN, "1:success"))
+        self.assertTrue(db.nudge_already_sent(proactive.TRIGGER_CI_RUN, "2:failure"))
+
+    def test_three_runs_same_repo_and_sha_are_grouped_together(self):
+        repo = proactive.CI_REPOS[0]
+        _insert_cached_ci_run(1, repo=repo, workflow="Lint", sha="abc123", conclusion="success")
+        _insert_cached_ci_run(2, repo=repo, workflow="Tests", sha="abc123", conclusion="failure")
+        _insert_cached_ci_run(3, repo=repo, workflow="Deploy", sha="abc123", conclusion="success")
+        loop = _RecordingLoop()
+        loop._check_ci_runs()
+        self.assertEqual(len(loop.spoken), 1)
+        msg = loop.spoken[0]
+        self.assertIn("Lint passed", msg)
+        self.assertIn("Tests failed", msg)
+        self.assertIn("Deploy passed", msg)
+
+    def test_runs_different_sha_same_repo_are_not_grouped(self):
+        repo = proactive.CI_REPOS[0]
+        _insert_cached_ci_run(1, repo=repo, workflow="Lint", sha="sha-one", conclusion="success")
+        _insert_cached_ci_run(2, repo=repo, workflow="Tests", sha="sha-two", conclusion="failure")
+        loop = _RecordingLoop()
+        loop._check_ci_runs()
+        self.assertEqual(len(loop.spoken), 2, "different commits must nudge separately, not be combined")
+
+    def test_runs_different_repo_same_sha_are_not_grouped(self):
+        repo_a, repo_b = proactive.CI_REPOS
+        _insert_cached_ci_run(1, repo=repo_a, workflow="Lint", sha="same-sha", conclusion="success")
+        _insert_cached_ci_run(2, repo=repo_b, workflow="Tests", sha="same-sha", conclusion="failure")
+        loop = _RecordingLoop()
+        loop._check_ci_runs()
+        self.assertEqual(len(loop.spoken), 2)
+
+    def test_a_run_already_nudged_in_a_prior_tick_is_not_pulled_into_a_new_groups_message(self):
+        repo = proactive.CI_REPOS[0]
+        _insert_cached_ci_run(1, repo=repo, workflow="Lint", sha="abc123", conclusion="success")
+        loop = _RecordingLoop()
+        loop._check_ci_runs()
+        self.assertEqual(len(loop.spoken), 1)
+        self.assertNotIn("Tests", loop.spoken[0])
+
+        # A second, slower workflow for the same push completes on a
+        # later tick — must nudge on its own, not silently merge into
+        # (or get suppressed by) the already-nudged first run.
+        _insert_cached_ci_run(2, repo=repo, workflow="Tests", sha="abc123", conclusion="failure")
+        loop._check_ci_runs()
+        self.assertEqual(len(loop.spoken), 2)
+        self.assertIn("Tests", loop.spoken[1])
+        self.assertNotIn("Lint", loop.spoken[1])
+
+    def test_gating_suppresses_single_ci_nudge_and_leaves_it_undedup(self):
+        _insert_cached_ci_run(1, conclusion="failure")
+        loop = _RecordingLoop(is_muted=lambda: True)
+        loop._check_ci_runs()
+        self.assertEqual(loop.spoken, [])
+        self.assertFalse(db.nudge_already_sent(proactive.TRIGGER_CI_RUN, "1:failure"))
+
+    def test_gating_suppresses_grouped_nudge_and_leaves_all_members_undedup(self):
+        repo = proactive.CI_REPOS[0]
+        _insert_cached_ci_run(1, repo=repo, workflow="Lint", sha="abc123", conclusion="success")
+        _insert_cached_ci_run(2, repo=repo, workflow="Tests", sha="abc123", conclusion="failure")
+        loop = _RecordingLoop(is_muted=lambda: True)
+        loop._check_ci_runs()
+        self.assertEqual(loop.spoken, [])
+        self.assertFalse(db.nudge_already_sent(proactive.TRIGGER_CI_RUN, "1:success"))
+        self.assertFalse(db.nudge_already_sent(proactive.TRIGGER_CI_RUN, "2:failure"))
+
+
 class TickCadenceTest(ProactiveTestCase):
     def test_sync_runs_on_first_tick_then_not_again_before_five_minutes(self):
         cfg = {"calendar_enabled": True}
@@ -610,6 +1014,81 @@ class TickCadenceTest(ProactiveTestCase):
         )
         self.assertGreaterEqual(due_duration, SIMULATED_NETWORK_DELAY_SEC)
         self.assertLess(not_due_duration, SIMULATED_NETWORK_DELAY_SEC / 2)
+
+    def test_ci_sync_runs_on_first_tick_then_not_again_before_five_minutes(self):
+        cfg = {"github_ci_enabled": True}
+        sync_calls: list[datetime] = []
+
+        class CountingLoop(_RecordingLoop):
+            def _sync_ci(self):
+                sync_calls.append(self._now())
+
+        clock = {"t": datetime(2026, 8, 10, 9, 0, 0)}
+        loop  = CountingLoop(now=lambda: clock["t"])
+
+        with patch.object(proactive, "load_config", lambda: cfg):
+            loop._tick()                                           # t=0:00 -> due (first ever)
+            clock["t"] += timedelta(seconds=proactive.POLL_INTERVAL_SEC)
+            loop._tick()                                           # t=1:00 -> not due
+            clock["t"] += timedelta(seconds=proactive.POLL_INTERVAL_SEC)
+            loop._tick()                                           # t=2:00 -> not due
+            clock["t"] += timedelta(seconds=proactive.CI_SYNC_INTERVAL_SEC)
+            loop._tick()                                           # t=7:00 -> due again
+
+        self.assertEqual(len(sync_calls), 2)
+
+    def test_non_sync_ticks_never_touch_requests_get(self):
+        """A tick that isn't due for a CI sync must not call into
+        requests.get at all — proves its timing can't depend on GitHub
+        API latency, without needing a real network call to demonstrate it."""
+        cfg = {"github_ci_enabled": True}
+        fake_auth = _fake_github_ci_auth_module("fake-token")
+        touched   = {"count": 0}
+
+        def _counting_get(url, headers=None, params=None, timeout=None):
+            touched["count"] += 1
+            return _FakeGithubResponse({"workflow_runs": []})
+
+        clock = {"t": datetime(2026, 8, 10, 9, 0, 0)}
+        loop  = _RecordingLoop(now=lambda: clock["t"])
+
+        with patch.object(proactive, "load_config", lambda: cfg), \
+             patch.dict(sys.modules, {"core.github_ci_auth": fake_auth}), \
+             patch("requests.get", side_effect=_counting_get):
+            loop._tick()                                            # due
+            clock["t"] += timedelta(seconds=proactive.POLL_INTERVAL_SEC)
+            loop._tick()                                            # not due
+            clock["t"] += timedelta(seconds=proactive.POLL_INTERVAL_SEC)
+            loop._tick()                                            # not due
+
+        # One tick due -> one requests.get call per watched repo.
+        self.assertEqual(touched["count"], len(proactive.CI_REPOS))
+
+    def test_calendar_and_ci_sync_cadences_are_independent(self):
+        """Both decoupled timers live in the same _tick() now — confirm
+        they don't interfere with or accidentally share state: CI syncing
+        on its own schedule must not perturb calendar's, and vice versa."""
+        cfg = {"calendar_enabled": True, "github_ci_enabled": True}
+        calendar_calls: list[datetime] = []
+        ci_calls:       list[datetime] = []
+
+        class CountingLoop(_RecordingLoop):
+            def _sync_calendar(self):
+                calendar_calls.append(self._now())
+
+            def _sync_ci(self):
+                ci_calls.append(self._now())
+
+        clock = {"t": datetime(2026, 8, 10, 9, 0, 0)}
+        loop  = CountingLoop(now=lambda: clock["t"])
+
+        with patch.object(proactive, "load_config", lambda: cfg):
+            loop._tick()                                            # t=0:00 -> both due (first ever)
+            clock["t"] += timedelta(seconds=proactive.CALENDAR_SYNC_INTERVAL_SEC)
+            loop._tick()                                            # t=5:00 -> both due again (same interval)
+
+        self.assertEqual(len(calendar_calls), 2)
+        self.assertEqual(len(ci_calls), 2)
 
 
 if __name__ == "__main__":

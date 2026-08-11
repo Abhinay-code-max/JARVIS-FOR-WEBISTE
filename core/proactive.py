@@ -2,28 +2,32 @@
 core/proactive.py
 ==================
 Phase-1 proactive nudges: JARVIS surfacing things unprompted, sourced
-entirely from data it already generates about itself (approvals, tasks).
-No external event source (calendar, messages, CI, ...) — that's a
-separate, unbuilt future phase.
+entirely from data it already generates about itself (approvals, tasks),
+plus two read-only external sources it polls for.
 
-Three trigger types:
+Four trigger types:
   - a background approval that's been pending too long (core/task_approval.py)
   - a background task that failed with an unhandled exception (agent/task_queue.py's
     _run_task except-block, which logs but never speaks — the one failure
     path in the app that today produces zero spoken feedback, ever, even
     when the task was submitted with a live speak callback)
-  - a Google Calendar event starting soon (core/calendar_auth.py) — the
-    one trigger sourced from outside JARVIS's own data, read-only,
+  - a Google Calendar event starting soon (core/calendar_auth.py) — read-only,
     opt-in via config's calendar_enabled flag
+  - a GitHub Actions workflow run finishing, on either of two watched
+    repos (core/github_ci_auth.py) — read-only, opt-in via config's
+    github_ci_enabled flag, polled via the GitHub REST API rather than a
+    webhook receiver (this app has no public HTTPS endpoint — the same
+    reason WhatsApp's push model doesn't fit either)
 
 Single daemon poll loop, not a job-scheduler library — this app has one
 process, one user, and a handful of trigger types; a sleep loop is the
 right size (see agent/task_queue.py / core/task_approval.py for the same
-reasoning applied to their own machinery). The calendar trigger runs on
-its own, slower cadence (CALENDAR_SYNC_INTERVAL_SEC) *inside* this same
-loop rather than a second thread — see _sync_calendar()'s docstring for
-why a live network call on every 60s tick would be a regression the
-other two triggers don't have today.
+reasoning applied to their own machinery). The calendar and CI triggers
+each run on their own, slower cadence (CALENDAR_SYNC_INTERVAL_SEC /
+CI_SYNC_INTERVAL_SEC) *inside* this same loop rather than a second thread
+per source — see _sync_calendar()'s and _sync_ci()'s docstrings for why a
+live network call on every 60s tick would be a regression the purely-local
+triggers don't have today.
 
 Delivery reuses the existing TTS queue (JarvisXL.speak() / main.py) — the
 same pathway the agent_task tool already uses to speak background-task
@@ -45,11 +49,13 @@ from typing import Callable
 from config import load_config
 from core.db import (
     get_cached_calendar_events,
+    get_cached_ci_runs,
     get_conn,
     get_step_outcomes,
     nudge_already_sent,
     record_nudge,
     replace_calendar_cache,
+    replace_ci_cache,
 )
 from core.task_approval import TASK_APPROVAL
 
@@ -76,6 +82,26 @@ CALENDAR_LEAD_TIME_SEC     = 600
 CALENDAR_SYNC_WINDOW_SEC   = 1800
 
 TRIGGER_CALENDAR_EVENT = "calendar_event_upcoming"
+
+# GitHub CI: same 5-min sync cadence as calendar, checked every 60s tick
+# against local cache only. No lead-time window here — unlike a calendar
+# event (which needs to be caught before it starts), a workflow run is a
+# discrete, already-happened completion; the only "when" question is
+# "have we nudged about this (run_id, conclusion) pair yet," handled by
+# proactive_nudges dedup, not a time-based filter.
+CI_SYNC_INTERVAL_SEC = 300
+
+CI_REPOS = [
+    "Abhinay-code-max/eyv-website-2",
+    "Abhinay-code-max/JARVIS-FOR-WEBISTE",
+]
+
+# GitHub's REST API version identifier — a stable string, not a rolling
+# date; unrelated to the docs site's own versioning. See
+# https://docs.github.com/en/rest/about-the-rest-api/api-versions
+_GITHUB_API_VERSION = "2022-11-28"
+
+TRIGGER_CI_RUN = "ci_run_completed"
 
 
 def _parse_calendar_event(item: dict) -> dict | None:
@@ -131,6 +157,25 @@ def _parse_calendar_event(item: dict) -> dict | None:
     }
 
 
+def _parse_ci_run(item: dict) -> dict:
+    """Converts one raw 'List workflow runs for a repository' item into
+    the flat dict replace_ci_cache() expects. Unlike
+    _parse_calendar_event(), never returns None — every field used here
+    (id, head_sha, html_url) is a required field in GitHub's own response
+    schema, so there's no realistic malformed-item case to defend
+    against the way Calendar's optional dateTime/date split needs."""
+    return {
+        "run_id":     item["id"],
+        "workflow":   item.get("name") or "(unnamed workflow)",
+        "title":      item.get("display_title") or "",
+        "branch":     item.get("head_branch"),
+        "sha":        item.get("head_sha", ""),
+        "status":     item.get("status") or "",
+        "conclusion": item.get("conclusion"),
+        "html_url":   item.get("html_url", ""),
+    }
+
+
 def _quiet_hours_active(cfg: dict, now: datetime | None = None) -> bool:
     """True if `now` (default: current time) falls inside the configured
     quiet_hours window. Config shape: {"quiet_hours": {"start": "HH:MM",
@@ -174,6 +219,10 @@ class ProactiveLoop:
         # first sync on the loop's first tick rather than waiting a full
         # CALENDAR_SYNC_INTERVAL_SEC after startup.
         self._last_calendar_sync: float = 0.0
+        # Same pattern, independent cadence, for the CI trigger — decoupled
+        # from calendar's own timer so one sync's cadence never affects
+        # the other's.
+        self._last_ci_sync: float = 0.0
         self._running = False
 
     def _gated_speak(self, text: str) -> bool:
@@ -325,6 +374,137 @@ class ProactiveLoop:
             if self._gated_speak(msg):
                 record_nudge(TRIGGER_CALENDAR_EVENT, event_id)
 
+    # -- trigger: GitHub Actions workflow run completed -----------------------
+
+    def _sync_ci(self) -> None:
+        """Refreshes ci_runs_cache from the GitHub REST API, one watched
+        repo at a time. Called from _tick() at most once every
+        CI_SYNC_INTERVAL_SEC — same decoupled-cadence reasoning as
+        _sync_calendar(): a live network call on every 60s tick would
+        block the other, purely-local checks behind network latency or a
+        hung connection.
+
+        No incremental "changed since X" fetch: GitHub's `created` query
+        filter on this endpoint only narrows by *creation* time, so it
+        can't catch a run that was created earlier and has since
+        transitioned to 'completed' — the actual event this trigger cares
+        about. At this volume (2 repos, 30 most-recent runs each) a full
+        re-fetch-and-diff-via-cache every cycle is simpler than working
+        around that and costs nothing meaningful against the 5,000-
+        requests/hour rate limit.
+
+        On any failure (not yet authorized, network error, bad/revoked
+        token, rate limit) for a given repo, this logs and moves on to
+        the next repo — replace_ci_cache() only replaces the ONE repo
+        it's given, so one repo's outage never wipes the other repo's
+        still-valid cache. A GitHub outage must never take down the
+        other three triggers or the loop itself."""
+        if not load_config().get("github_ci_enabled"):
+            return
+
+        try:
+            from core import github_ci_auth
+        except ImportError:
+            _log.warning(
+                "github_ci_enabled is set but core.github_ci_auth is unavailable — "
+                "see that module for setup."
+            )
+            return
+
+        try:
+            token = github_ci_auth.get_github_token()
+        except Exception:
+            _log.warning("GitHub token read failed — skipping this sync cycle", exc_info=True)
+            return
+
+        if not token:
+            _log.debug(
+                "GitHub CI not authorized yet — run `python -m core.github_ci_auth` "
+                "(see that module's docstring)."
+            )
+            return
+
+        import requests
+
+        headers = {
+            "Authorization":        f"Bearer {token}",
+            "Accept":                "application/vnd.github+json",
+            "X-GitHub-Api-Version": _GITHUB_API_VERSION,
+        }
+
+        for repo in CI_REPOS:
+            try:
+                resp = requests.get(
+                    f"https://api.github.com/repos/{repo}/actions/runs",
+                    headers=headers, params={"per_page": 30}, timeout=15,
+                )
+                resp.raise_for_status()
+                items = resp.json().get("workflow_runs", [])
+            except Exception:
+                _log.warning("CI sync failed for %s — serving last-known cache", repo, exc_info=True)
+                continue
+
+            replace_ci_cache(repo, [_parse_ci_run(item) for item in items])
+
+    @staticmethod
+    def _ci_outcome_word(conclusion: str) -> str:
+        return "passed" if conclusion == "success" else "failed"
+
+    def _check_ci_runs(self) -> None:
+        """Dedup key is (run_id, conclusion), not run_id alone — encoded
+        as a single composite ref_id string ("{run_id}:{conclusion}") so
+        this reuses proactive_nudges exactly as-is, no schema change.
+        This matters concretely: GitHub's "re-run failed jobs" reuses the
+        same run_id and just updates its conclusion in place, so a
+        failure followed by a later successful re-run of the *same*
+        run_id must be two separate dedup rows — keying on run_id alone
+        would silently swallow the follow-up success nudge the moment the
+        failure had already been nudged.
+
+        Grouping is a separate, presentation-only concern layered on top:
+        a single push can fan out into several workflow runs (one per
+        workflow file) that typically complete within moments of each
+        other, which would otherwise mean several back-to-back
+        _gated_speak() calls for what the user experiences as one event.
+        Runs newly qualifying in this same tick are grouped by
+        (repo, sha) and spoken as one combined nudge when there's more
+        than one — dedup rows are still written per (run_id, conclusion)
+        underneath, so this only changes how many times _gated_speak() is
+        called, never the correctness of what's been nudged."""
+        candidates = []
+        for row in get_cached_ci_runs():
+            if row["status"] != "completed" or row["conclusion"] not in ("success", "failure"):
+                continue
+            ref_id = f"{row['run_id']}:{row['conclusion']}"
+            if nudge_already_sent(TRIGGER_CI_RUN, ref_id):
+                continue
+            candidates.append((row, ref_id))
+
+        if not candidates:
+            return
+
+        groups: dict[tuple[str, str], list] = {}
+        for row, ref_id in candidates:
+            groups.setdefault((row["repo"], row["sha"]), []).append((row, ref_id))
+
+        for (repo, _sha), members in groups.items():
+            if len(members) == 1:
+                row, _ = members[0]
+                if row["conclusion"] == "failure":
+                    msg = f"Sir, the '{row['workflow']}' workflow failed on {repo} — {row['title']}."
+                else:
+                    msg = f"Sir, '{row['workflow']}' passed on {repo} — {row['title']}."
+            else:
+                parts = ", ".join(
+                    f"{row['workflow']} {self._ci_outcome_word(row['conclusion'])}"
+                    for row, _ in members
+                )
+                msg = f"Sir, CI finished for {repo} — {parts}."
+
+            if self._gated_speak(msg):
+                for _, ref_id in members:
+                    record_nudge(TRIGGER_CI_RUN, ref_id)
+
     def _tick(self) -> None:
         try:
             self._check_stale_approvals()
@@ -346,6 +526,17 @@ class ProactiveLoop:
             self._check_calendar_events()
         except Exception:
             _log.warning("Calendar event check failed", exc_info=True)
+
+        if now - self._last_ci_sync >= CI_SYNC_INTERVAL_SEC:
+            self._last_ci_sync = now
+            try:
+                self._sync_ci()
+            except Exception:
+                _log.warning("CI sync failed", exc_info=True)
+        try:
+            self._check_ci_runs()
+        except Exception:
+            _log.warning("CI run check failed", exc_info=True)
 
     def run(self) -> None:
         # Forces TaskQueue.start() (and its startup reconciliation pass —

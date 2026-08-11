@@ -198,6 +198,34 @@ CREATE TABLE IF NOT EXISTS calendar_events_cache (
     rsvp_status TEXT,
     synced_at   REAL NOT NULL
 );
+
+-- Local read cache for the ci_run_completed trigger (core/proactive.py's
+-- _sync_ci()/_check_ci_runs()) — same shape and purpose as
+-- calendar_events_cache: a snapshot of each watched repo's most recent
+-- workflow runs, refreshed every 5 minutes so the 60s trigger check never
+-- makes a network call itself. `run_id` is GitHub's own id, globally
+-- unique across every repo, so no composite key is needed even though
+-- multiple repos share this table. `repo` is "owner/repo", matching
+-- core/proactive.py's CI_REPOS entries exactly, so a per-repo sync can
+-- replace just that repo's rows (DELETE ... WHERE repo = ?) without
+-- touching the other watched repo's still-valid cache — unlike
+-- calendar_events_cache's single-calendar full-table replace, this table
+-- holds more than one independent source and a sync failure for one repo
+-- must never wipe another repo's last-known-good rows. `conclusion` is
+-- NULL while `status` isn't yet 'completed' (queued/in_progress runs
+-- always have a null conclusion, matching GitHub's own representation).
+CREATE TABLE IF NOT EXISTS ci_runs_cache (
+    run_id     INTEGER PRIMARY KEY,
+    repo       TEXT NOT NULL,
+    workflow   TEXT NOT NULL,
+    title      TEXT NOT NULL,
+    branch     TEXT,
+    sha        TEXT NOT NULL,
+    status     TEXT NOT NULL,
+    conclusion TEXT,
+    html_url   TEXT NOT NULL,
+    synced_at  REAL NOT NULL
+);
 """
 
 
@@ -563,4 +591,46 @@ def get_cached_calendar_events() -> list[sqlite3.Row]:
     return conn.execute(
         "SELECT event_id, summary, start, all_day, status, rsvp_status "
         "FROM calendar_events_cache"
+    ).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# CI run cache (core/proactive.py's ci_run_completed trigger)
+# ---------------------------------------------------------------------------
+
+def replace_ci_cache(repo: str, runs: list[dict]) -> None:
+    """Replaces `repo`'s rows in ci_runs_cache with `runs` (each a dict
+    with run_id/workflow/title/branch/sha/status/conclusion/html_url) in
+    one transaction. Scoped to `repo` — DELETE ... WHERE repo = ?, not a
+    full-table delete — because this table holds more than one watched
+    repo's runs and a sync failure for one repo must never wipe another
+    repo's last-known-good cache (see the table's own schema comment;
+    this is the one deliberate difference from replace_calendar_cache()'s
+    full-table replace, which only ever has one calendar to worry about).
+    Dedup for the trigger itself lives in proactive_nudges, not here —
+    this table is purely a read cache, safe to fully replace per-repo on
+    every sync regardless of what's already been nudged."""
+    conn = get_conn()
+    now = time.time()
+    with conn:
+        conn.execute("DELETE FROM ci_runs_cache WHERE repo = ?", (repo,))
+        conn.executemany(
+            "INSERT INTO ci_runs_cache "
+            "(run_id, repo, workflow, title, branch, sha, status, conclusion, html_url, synced_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    r["run_id"], repo, r["workflow"], r["title"], r.get("branch"),
+                    r["sha"], r["status"], r.get("conclusion"), r["html_url"], now,
+                )
+                for r in runs
+            ],
+        )
+
+
+def get_cached_ci_runs() -> list[sqlite3.Row]:
+    conn = get_conn()
+    return conn.execute(
+        "SELECT run_id, repo, workflow, title, branch, sha, status, conclusion, html_url "
+        "FROM ci_runs_cache"
     ).fetchall()

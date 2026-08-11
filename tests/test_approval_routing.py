@@ -204,14 +204,18 @@ class ApprovalRoutingTest(HermesApiTestCase):
         risk as the weather_report/create_plan lessons elsewhere in this
         phase.
 
-        Second finding, also real: AgentExecutor.execute() never raises
-        for "ran out of replan attempts" / "no valid plan" — it returns
-        a plain string either way — so agent/task_queue.py's TaskQueue
-        marks the overall Task 'completed' regardless of whether the
-        goal was actually achieved (only an uncaught exception produces
-        'failed' at the Task level). The real, granular outcome — the
-        denied step itself — lives in task_events, not Task.status; that
-        is what this test actually checks."""
+        Second finding, real and now fixed (Step 1.6c): AgentExecutor.
+        execute() never raises for "ran out of replan attempts" / "no
+        valid plan" — it returns a plain string either way — so
+        agent/task_queue.py's TaskQueue used to mark the overall Task
+        'completed' regardless of whether the goal was actually achieved
+        (only an uncaught exception used to produce 'failed' at the Task
+        level). Fixed by checking the real, durable outcome
+        (core.db.get_step_outcomes(), the same helper _summarize()
+        itself trusts) after execute() returns, rather than trusting a
+        lack of exception as success — see
+        agent/task_queue.py's _last_terminal_failure_detail(). This test
+        now asserts the fixed behavior directly."""
         orig_tool   = tdisp.TOOL_DISPATCH.get("code_helper")
         orig_replan = executor.replan
         tdisp.TOOL_DISPATCH["code_helper"] = lambda args, player, speak: "SHOULD NEVER RUN — DENIED"
@@ -226,10 +230,11 @@ class ApprovalRoutingTest(HermesApiTestCase):
                 if approval is not None:
                     ta_mod.TASK_APPROVAL.answer(approval["approval_id"], approve=False)
 
-            # Task.status: 'completed' is the correct, expected outcome
-            # here — execute() returned a string, never raised.
+            # Expected (Step 1.6c): Task.status must reflect the real
+            # denial, not silently read as 'completed'.
             status = self._wait_for_task(task_id, timeout=5.0)
-            self.assertEqual(status["status"], "completed", status)
+            self.assertEqual(status["status"], "failed", status)
+            self.assertIn("approval_denied", status["error"])
         finally:
             if orig_tool is not None:
                 tdisp.TOOL_DISPATCH["code_helper"] = orig_tool

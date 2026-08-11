@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Any
 
-from core.db import get_conn
+from core.db import get_conn, get_step_outcomes
 
 _log = logging.getLogger("jarvis.task_queue")
 
@@ -98,6 +98,41 @@ def _reconcile_orphaned_approvals() -> None:
         n = cur.rowcount
     if n:
         _log.warning("Marked %d orphaned approval(s) from a previous run as expired.", n)
+
+
+def _last_terminal_failure_detail(task_id: str) -> str | None:
+    """Headless-extraction phase, Step 1.6c. AgentExecutor.execute()
+    never raises for "ran out of replan attempts" / "no valid plan" / a
+    denied or hard-denied step it ultimately gave up on — it returns a
+    plain string, same convention as every tool result in this codebase
+    (see agent/executor.py). Task.status must not blindly read that as
+    success: this checks the real, durable outcome via
+    get_step_outcomes() — the same helper _summarize() itself trusts —
+    rather than pattern-matching the returned message text.
+
+    Returns the last step segment's own detail string (e.g.
+    "approval_denied: ..." or "hard_denied: ...", the exact vocabulary
+    _short_circuit_reason() already established) if the task's most
+    recently logged segment ended in 'failed' — meaning the task
+    genuinely gave up on that failure rather than recovering from it via
+    a later replan attempt. A step that failed but was later followed by
+    a real 'done'/'skipped' segment (a successful replan-recovery) is
+    NOT reported here — get_step_outcomes()'s segments are chronological,
+    so the *last* one is what execute() actually ended on.
+
+    None if the real last outcome was 'done'/'skipped' (a genuine
+    success or acceptable skip) or if there are no outcomes logged at
+    all — the "no valid plan could ever be created, not even a first
+    attempt" case has no task_events history to check against and is
+    deliberately out of this fix's scope; it keeps its existing
+    'completed' behavior."""
+    outcomes = get_step_outcomes(task_id)
+    if not outcomes:
+        return None
+    last = outcomes[-1]
+    if last["status"] == "failed":
+        return last["detail"] or "failed"
+    return None
 
 
 class TaskQueue:
@@ -289,14 +324,31 @@ class TaskQueue:
                 if task.cancel_flag.is_set():
                     task.status = TaskStatus.CANCELLED
                 else:
-                    task.status = TaskStatus.COMPLETED
-                    task.result = result
+                    failure_detail = _last_terminal_failure_detail(task.task_id)
+                    if failure_detail is not None:
+                        # See _last_terminal_failure_detail's docstring —
+                        # execute() returned normally (no exception), but
+                        # the real, durable outcome was a step the task
+                        # ultimately gave up on (a denial, a hard-deny,
+                        # etc.), not a genuine completion.
+                        task.status = TaskStatus.FAILED
+                        task.error  = failure_detail
+                    else:
+                        task.status = TaskStatus.COMPLETED
+                        task.result = result
                 self._active_count -= 1
 
             self._write_task_row(
                 task.task_id,
                 status = task.status.value,
                 result = task.result if isinstance(task.result, str) else str(task.result) if task.result is not None else None,
+                # Written on this path too now (previously only the
+                # except-Exception path below persisted it) — a denial's
+                # error detail must survive in the durable `tasks` row,
+                # not just the in-memory Task object get_status() reads.
+                # "" (not None) for the non-failed case, matching
+                # submit()'s own INSERT convention for a task with no error.
+                error  = task.error if task.status == TaskStatus.FAILED else "",
             )
 
             if task.on_complete and not task.cancel_flag.is_set():

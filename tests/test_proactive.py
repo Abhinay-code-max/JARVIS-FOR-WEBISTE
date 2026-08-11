@@ -1,10 +1,18 @@
 """
 tests/test_proactive.py
 ========================
-Phase-1 proactive nudges (core/proactive.py): the two trigger types, the
+Phase-1 proactive nudges (core/proactive.py): the three trigger types, the
 speaking/muted/quiet-hours gate, and the dedup story for each trigger
-(durable table for failed tasks, in-memory-only for stale approvals — see
-core/db.py's proactive_nudges schema comment for why they differ).
+(durable table for failed tasks and calendar events, in-memory-only for
+stale approvals — see core/db.py's proactive_nudges schema comment for
+why they differ).
+
+The calendar trigger's tests never import the real google-* packages
+(not installed in this environment, matching most real installs that
+haven't opted into calendar_enabled) — core.calendar_auth is stood in
+for via sys.modules patching, since core/proactive.py's `from core import
+calendar_auth` is a lazy, function-local import specifically so a
+missing/failing calendar_auth can never break the other two triggers.
 
 Redirects core.db at a fresh temp sqlite file, same pattern as the other
 test modules in this package, so nothing here touches data/jarvis.db.
@@ -15,9 +23,11 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -60,6 +70,80 @@ def _insert_pending_approval(approval_id: int, prompt: str, requested_at: float,
             (approval_id, prompt, requested_at, task_id),
         )
     TASK_APPROVAL._pending[approval_id] = _PendingApproval()
+
+
+def _insert_cached_event(
+    event_id: str, start_ts: float, summary: str = "Standup",
+    all_day: bool = False, status: str = "confirmed", rsvp_status: str | None = None,
+):
+    """Writes directly into calendar_events_cache — bypasses
+    _sync_calendar() entirely, so trigger-logic tests (filters, lead
+    time, dedup) don't need a fake Google API client at all."""
+    conn = db.get_conn()
+    with conn:
+        conn.execute(
+            "INSERT INTO calendar_events_cache "
+            "(event_id, summary, start, all_day, status, rsvp_status, synced_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (event_id, summary, start_ts, 1 if all_day else 0, status, rsvp_status, time.time()),
+        )
+
+
+def _google_event(
+    event_id: str, start_dt: datetime, summary: str = "Standup",
+    status: str = "confirmed", all_day: bool = False, rsvp_status: str | None = None,
+) -> dict:
+    """One raw Events.list() item, in Google's own shape — for
+    _sync_calendar()/_parse_calendar_event() tests only."""
+    item: dict = {"id": event_id, "summary": summary, "status": status}
+    item["start"] = (
+        {"date": start_dt.strftime("%Y-%m-%d")} if all_day
+        else {"dateTime": start_dt.isoformat()}
+    )
+    if rsvp_status is not None:
+        item["attendees"] = [{"self": True, "responseStatus": rsvp_status}]
+    return item
+
+
+class _FakeEventsCall:
+    def __init__(self, response=None, error=None):
+        self._response = response
+        self._error    = error
+
+    def execute(self):
+        if self._error:
+            raise self._error
+        return self._response
+
+
+class _FakeEvents:
+    def __init__(self, response=None, error=None):
+        self._response = response
+        self._error    = error
+
+    def list(self, **kwargs):
+        return _FakeEventsCall(self._response, self._error)
+
+
+class _FakeService:
+    """Mimics googleapiclient's service.events().list().execute() chain
+    just enough for _sync_calendar()'s tests."""
+
+    def __init__(self, response=None, error=None):
+        self._response = response
+        self._error    = error
+
+    def events(self):
+        return _FakeEvents(self._response, self._error)
+
+
+def _fake_calendar_auth_module(service) -> types.ModuleType:
+    """A stand-in for core.calendar_auth, registered into sys.modules so
+    core/proactive.py's lazy `from core import calendar_auth` picks it up
+    instead of the real (google-* dependent) module."""
+    fake = types.ModuleType("core.calendar_auth")
+    fake.get_calendar_service = lambda: service
+    return fake
 
 
 class _RecordingLoop(proactive.ProactiveLoop):
@@ -216,6 +300,316 @@ class GatingTest(ProactiveTestCase):
         self.assertFalse(proactive._quiet_hours_active({}))
         self.assertFalse(proactive._quiet_hours_active({"quiet_hours": {}}))
         self.assertFalse(proactive._quiet_hours_active({"quiet_hours": {"start": "bad"}}))
+
+
+class ParseCalendarEventTest(unittest.TestCase):
+    def test_timed_event_parses_absolute_start_and_is_not_all_day(self):
+        start  = datetime.now(timezone.utc) + timedelta(minutes=5)
+        parsed = proactive._parse_calendar_event(_google_event("e1", start))
+        self.assertIsNotNone(parsed)
+        self.assertFalse(parsed["all_day"])
+        self.assertAlmostEqual(parsed["start"], start.timestamp(), delta=1)
+
+    def test_all_day_event_is_flagged(self):
+        start  = datetime.now(timezone.utc)
+        parsed = proactive._parse_calendar_event(_google_event("e2", start, all_day=True))
+        self.assertTrue(parsed["all_day"])
+
+    def test_self_attendee_rsvp_is_extracted(self):
+        start  = datetime.now(timezone.utc) + timedelta(minutes=5)
+        parsed = proactive._parse_calendar_event(_google_event("e3", start, rsvp_status="declined"))
+        self.assertEqual(parsed["rsvp_status"], "declined")
+
+    def test_no_attendees_means_no_rsvp_status(self):
+        start  = datetime.now(timezone.utc) + timedelta(minutes=5)
+        parsed = proactive._parse_calendar_event(_google_event("e4", start))
+        self.assertIsNone(parsed["rsvp_status"])
+
+    def test_malformed_item_with_no_start_returns_none(self):
+        item = {"id": "e5", "summary": "broken", "status": "confirmed", "start": {}}
+        self.assertIsNone(proactive._parse_calendar_event(item))
+
+
+class SyncCalendarTest(ProactiveTestCase):
+    def test_disabled_by_default_never_touches_calendar_auth(self):
+        """calendar_enabled defaults to unset/False — _sync_calendar()
+        must return before even importing core.calendar_auth. Proven by
+        NOT registering any fake module: if it tried the real import,
+        this would raise (google-* packages aren't installed here)."""
+        loop = _RecordingLoop()
+        loop._sync_calendar()
+        self.assertEqual(db.get_cached_calendar_events(), [])
+
+    def test_enabled_populates_cache_from_api_response(self):
+        start    = datetime.now(timezone.utc) + timedelta(minutes=5)
+        response = {"items": [_google_event("e1", start, summary="Standup")]}
+        fake_auth = _fake_calendar_auth_module(_FakeService(response=response))
+        cfg       = {"calendar_enabled": True}
+
+        with patch.dict(sys.modules, {"core.calendar_auth": fake_auth}), \
+             patch.object(proactive, "load_config", lambda: cfg):
+            _RecordingLoop()._sync_calendar()
+
+        cached = db.get_cached_calendar_events()
+        self.assertEqual(len(cached), 1)
+        self.assertEqual(cached[0]["event_id"], "e1")
+        self.assertEqual(cached[0]["summary"], "Standup")
+
+    def test_not_yet_authorized_service_is_none_leaves_cache_empty(self):
+        cfg       = {"calendar_enabled": True}
+        fake_auth = _fake_calendar_auth_module(None)
+
+        with patch.dict(sys.modules, {"core.calendar_auth": fake_auth}), \
+             patch.object(proactive, "load_config", lambda: cfg):
+            _RecordingLoop()._sync_calendar()  # must not raise
+
+        self.assertEqual(db.get_cached_calendar_events(), [])
+
+    def test_api_failure_keeps_serving_last_known_cache(self):
+        """The resilience guarantee: a broken sync cycle must not wipe or
+        corrupt whatever the previous successful sync already cached."""
+        cfg   = {"calendar_enabled": True}
+        start = datetime.now(timezone.utc) + timedelta(minutes=5)
+        good  = {"items": [_google_event("e1", start)]}
+
+        with patch.object(proactive, "load_config", lambda: cfg):
+            with patch.dict(sys.modules, {"core.calendar_auth": _fake_calendar_auth_module(_FakeService(response=good))}):
+                _RecordingLoop()._sync_calendar()
+            self.assertEqual(len(db.get_cached_calendar_events()), 1)
+
+            failing = _fake_calendar_auth_module(_FakeService(error=ConnectionError("network down")))
+            with patch.dict(sys.modules, {"core.calendar_auth": failing}):
+                _RecordingLoop()._sync_calendar()  # must not raise
+
+        cached = db.get_cached_calendar_events()
+        self.assertEqual(len(cached), 1)
+        self.assertEqual(cached[0]["event_id"], "e1")
+
+    def test_get_calendar_service_raising_does_not_crash_sync(self):
+        cfg  = {"calendar_enabled": True}
+        fake = types.ModuleType("core.calendar_auth")
+
+        def _raise():
+            raise RuntimeError("token file corrupted")
+
+        fake.get_calendar_service = _raise
+
+        with patch.dict(sys.modules, {"core.calendar_auth": fake}), \
+             patch.object(proactive, "load_config", lambda: cfg):
+            _RecordingLoop()._sync_calendar()  # must not raise
+
+        self.assertEqual(db.get_cached_calendar_events(), [])
+
+    def test_tick_survives_an_unexpected_exception_inside_sync_calendar(self):
+        """Defense in depth beyond _sync_calendar()'s own try/excepts:
+        even if it somehow raised anyway, _tick()'s own wrapper must
+        keep the other two triggers running unaffected."""
+        cfg = {"calendar_enabled": True}
+        _insert_task("t1", "failed", error="x", goal="y")
+
+        class ExplodingLoop(_RecordingLoop):
+            def _sync_calendar(self):
+                raise RuntimeError("boom")
+
+        with patch.object(proactive, "load_config", lambda: cfg):
+            loop = ExplodingLoop()
+            loop._tick()  # must not raise
+
+        self.assertEqual(len(loop.spoken), 1)
+        self.assertIn("y", loop.spoken[0])
+
+
+class CalendarTriggerTest(ProactiveTestCase):
+    def test_event_within_lead_time_nudges_with_summary_and_minutes(self):
+        _insert_cached_event("e1", time.time() + 300, summary="Team Standup")
+        loop = _RecordingLoop()
+        loop._check_calendar_events()
+        self.assertEqual(len(loop.spoken), 1)
+        self.assertIn("Team Standup", loop.spoken[0])
+        self.assertIn("5 minute", loop.spoken[0])
+
+    def test_event_outside_lead_time_does_not_nudge(self):
+        _insert_cached_event("e1", time.time() + proactive.CALENDAR_LEAD_TIME_SEC + 60)
+        loop = _RecordingLoop()
+        loop._check_calendar_events()
+        self.assertEqual(loop.spoken, [])
+
+    def test_event_already_started_does_not_nudge(self):
+        _insert_cached_event("e1", time.time() - 30)
+        loop = _RecordingLoop()
+        loop._check_calendar_events()
+        self.assertEqual(loop.spoken, [])
+
+    def test_all_day_event_is_skipped(self):
+        _insert_cached_event("e1", time.time() + 300, all_day=True)
+        loop = _RecordingLoop()
+        loop._check_calendar_events()
+        self.assertEqual(loop.spoken, [])
+
+    def test_cancelled_event_is_skipped(self):
+        _insert_cached_event("e1", time.time() + 300, status="cancelled")
+        loop = _RecordingLoop()
+        loop._check_calendar_events()
+        self.assertEqual(loop.spoken, [])
+
+    def test_declined_rsvp_is_skipped(self):
+        _insert_cached_event("e1", time.time() + 300, rsvp_status="declined")
+        loop = _RecordingLoop()
+        loop._check_calendar_events()
+        self.assertEqual(loop.spoken, [])
+
+    def test_tentative_rsvp_still_nudges(self):
+        _insert_cached_event("e1", time.time() + 300, rsvp_status="tentative")
+        loop = _RecordingLoop()
+        loop._check_calendar_events()
+        self.assertEqual(len(loop.spoken), 1)
+
+    def test_needs_action_rsvp_still_nudges(self):
+        _insert_cached_event("e1", time.time() + 300, rsvp_status="needsAction")
+        loop = _RecordingLoop()
+        loop._check_calendar_events()
+        self.assertEqual(len(loop.spoken), 1)
+
+    def test_no_attendees_personal_block_still_nudges(self):
+        _insert_cached_event("e1", time.time() + 300, rsvp_status=None)
+        loop = _RecordingLoop()
+        loop._check_calendar_events()
+        self.assertEqual(len(loop.spoken), 1)
+
+    def test_second_check_does_not_renudge_the_same_event(self):
+        _insert_cached_event("e1", time.time() + 300)
+        loop = _RecordingLoop()
+        loop._check_calendar_events()
+        loop._check_calendar_events()
+        self.assertEqual(len(loop.spoken), 1)
+
+    def test_dedup_is_durable_across_a_simulated_restart(self):
+        _insert_cached_event("e1", time.time() + 300)
+        first_run = _RecordingLoop()
+        first_run._check_calendar_events()
+        self.assertEqual(len(first_run.spoken), 1)
+
+        second_run = _RecordingLoop()   # fresh in-memory state, same db
+        second_run._check_calendar_events()
+        self.assertEqual(second_run.spoken, [])
+
+    def test_recurring_event_instances_dedup_independently(self):
+        """Each occurrence's Google-assigned id is already globally
+        unique (confirmed in the plan) — no recurrence-aware logic
+        needed here, just proof two occurrences of 'the same meeting'
+        nudge independently rather than colliding on one dedup row."""
+        now = time.time()
+        _insert_cached_event("instance_20260810T090000Z", now + 300, summary="Daily Sync")
+        _insert_cached_event("instance_20260811T090000Z", now + 300, summary="Daily Sync")
+        loop = _RecordingLoop()
+        loop._check_calendar_events()
+        self.assertEqual(len(loop.spoken), 2)
+
+    def test_gating_suppresses_calendar_nudge_and_leaves_it_undedup(self):
+        _insert_cached_event("e1", time.time() + 300)
+        loop = _RecordingLoop(is_muted=lambda: True)
+        loop._check_calendar_events()
+        self.assertEqual(loop.spoken, [])
+        self.assertFalse(db.nudge_already_sent(proactive.TRIGGER_CALENDAR_EVENT, "e1"))
+
+
+class TickCadenceTest(ProactiveTestCase):
+    def test_sync_runs_on_first_tick_then_not_again_before_five_minutes(self):
+        cfg = {"calendar_enabled": True}
+        sync_calls: list[datetime] = []
+
+        class CountingLoop(_RecordingLoop):
+            def _sync_calendar(self):
+                sync_calls.append(self._now())
+
+        clock = {"t": datetime(2026, 8, 10, 9, 0, 0)}
+        loop  = CountingLoop(now=lambda: clock["t"])
+
+        with patch.object(proactive, "load_config", lambda: cfg):
+            loop._tick()                                           # t=0:00 -> due (first ever)
+            clock["t"] += timedelta(seconds=proactive.POLL_INTERVAL_SEC)
+            loop._tick()                                           # t=1:00 -> not due
+            clock["t"] += timedelta(seconds=proactive.POLL_INTERVAL_SEC)
+            loop._tick()                                           # t=2:00 -> not due
+            clock["t"] += timedelta(seconds=proactive.CALENDAR_SYNC_INTERVAL_SEC)
+            loop._tick()                                           # t=7:00 -> due again
+
+        self.assertEqual(len(sync_calls), 2)
+
+    def test_non_sync_ticks_never_touch_calendar_auth_at_all(self):
+        """A tick that isn't due for a sync must not call into the
+        calendar client in any way — proves its behavior (and therefore
+        its timing) can't depend on calendar latency, without needing a
+        real network call to demonstrate it."""
+        cfg     = {"calendar_enabled": True}
+        touched = {"count": 0}
+
+        class _CountingEvents:
+            def list(self, **kwargs):
+                touched["count"] += 1
+                return _FakeEventsCall({"items": []})
+
+        class _CountingService:
+            def events(self):
+                return _CountingEvents()
+
+        fake_auth = _fake_calendar_auth_module(_CountingService())
+        clock     = {"t": datetime(2026, 8, 10, 9, 0, 0)}
+        loop      = _RecordingLoop(now=lambda: clock["t"])
+
+        with patch.object(proactive, "load_config", lambda: cfg), \
+             patch.dict(sys.modules, {"core.calendar_auth": fake_auth}):
+            loop._tick()                                            # due
+            clock["t"] += timedelta(seconds=proactive.POLL_INTERVAL_SEC)
+            loop._tick()                                            # not due
+            clock["t"] += timedelta(seconds=proactive.POLL_INTERVAL_SEC)
+            loop._tick()                                            # not due
+
+        self.assertEqual(touched["count"], 1)
+
+    def test_sync_latency_is_isolated_to_the_tick_that_is_due(self):
+        """Times a due tick against a simulated slow calendar API call
+        against a not-due tick immediately after, to show the extra
+        latency is confined to the sync tick — a non-sync tick's timing
+        is structurally independent of calendar latency."""
+        cfg = {"calendar_enabled": True}
+        SIMULATED_NETWORK_DELAY_SEC = 0.15
+
+        class _SlowEventsCall:
+            def execute(self):
+                time.sleep(SIMULATED_NETWORK_DELAY_SEC)
+                return {"items": []}
+
+        class _SlowEvents:
+            def list(self, **kwargs):
+                return _SlowEventsCall()
+
+        class _SlowService:
+            def events(self):
+                return _SlowEvents()
+
+        fake_auth = _fake_calendar_auth_module(_SlowService())
+        clock     = {"t": datetime(2026, 8, 10, 9, 0, 0)}
+        loop      = _RecordingLoop(now=lambda: clock["t"])
+
+        with patch.object(proactive, "load_config", lambda: cfg), \
+             patch.dict(sys.modules, {"core.calendar_auth": fake_auth}):
+            due_start    = time.monotonic()
+            loop._tick()                                            # due -> pays the delay
+            due_duration = time.monotonic() - due_start
+
+            clock["t"] += timedelta(seconds=proactive.POLL_INTERVAL_SEC)
+            not_due_start    = time.monotonic()
+            loop._tick()                                            # not due -> must not pay it again
+            not_due_duration = time.monotonic() - not_due_start
+
+        print(
+            f"\n[timing] sync tick: {due_duration:.3f}s, "
+            f"non-sync tick: {not_due_duration:.3f}s "
+            f"(simulated network delay: {SIMULATED_NETWORK_DELAY_SEC}s)"
+        )
+        self.assertGreaterEqual(due_duration, SIMULATED_NETWORK_DELAY_SEC)
+        self.assertLess(not_due_duration, SIMULATED_NETWORK_DELAY_SEC / 2)
 
 
 if __name__ == "__main__":

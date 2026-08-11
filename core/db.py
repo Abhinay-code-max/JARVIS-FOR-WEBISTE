@@ -174,6 +174,30 @@ CREATE TABLE IF NOT EXISTS proactive_nudges (
     nudged_at    REAL NOT NULL,
     PRIMARY KEY (trigger_type, ref_id)
 );
+
+-- Local read cache for the calendar_event_upcoming trigger
+-- (core/proactive.py's _sync_calendar()/_check_calendar_events()) — a
+-- full-window snapshot of Google Calendar's primary calendar for
+-- roughly the next 30 minutes, refreshed every 5 minutes so the 60s
+-- trigger check never makes a network call itself (see the
+-- ProactiveLoop module docstring for why sync and check cadences are
+-- decoupled). `start` is a POSIX epoch (comparable directly against
+-- time.time()/self._now().timestamp()), computed from Google's RFC3339
+-- dateTime (which always carries an explicit UTC offset) — timezone-
+-- correct regardless of the calendar's or the machine's local zone.
+-- `rsvp_status` is the signed-in user's own attendee response
+-- ('accepted' | 'tentative' | 'declined' | 'needsAction'), NULL for
+-- events with no attendees list at all (e.g. a personal block the user
+-- created for themselves).
+CREATE TABLE IF NOT EXISTS calendar_events_cache (
+    event_id    TEXT PRIMARY KEY,
+    summary     TEXT NOT NULL,
+    start       REAL NOT NULL,
+    all_day     INTEGER NOT NULL,
+    status      TEXT NOT NULL,
+    rsvp_status TEXT,
+    synced_at   REAL NOT NULL
+);
 """
 
 
@@ -497,3 +521,46 @@ def record_nudge(trigger_type: str, ref_id: str) -> None:
             "VALUES (?, ?, ?)",
             (trigger_type, ref_id, time.time()),
         )
+
+
+# ---------------------------------------------------------------------------
+# Calendar event cache (core/proactive.py's calendar_event_upcoming trigger)
+# ---------------------------------------------------------------------------
+
+def replace_calendar_cache(events: list[dict]) -> None:
+    """Replaces the entire calendar_events_cache with `events` (each a
+    dict with event_id/summary/start/all_day/status/rsvp_status) in one
+    transaction. A full replace, not a field-by-field upsert: every sync
+    re-fetches the whole ~30-minute window from Google rather than doing
+    an incremental syncToken-based fetch (that's a possible later
+    optimization, not needed at this volume — see the proactive-phase-2
+    plan), so DELETE-then-INSERT already produces the exact same end
+    state a real upsert-plus-prune-missing would, with far less code.
+    Dedup for the trigger itself lives in proactive_nudges, not here —
+    this table is purely a read cache, safe to fully replace on every
+    sync regardless of what's already been nudged."""
+    conn = get_conn()
+    now = time.time()
+    with conn:
+        conn.execute("DELETE FROM calendar_events_cache")
+        conn.executemany(
+            "INSERT INTO calendar_events_cache "
+            "(event_id, summary, start, all_day, status, rsvp_status, synced_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    e["event_id"], e["summary"], e["start"],
+                    1 if e["all_day"] else 0, e["status"], e.get("rsvp_status"),
+                    now,
+                )
+                for e in events
+            ],
+        )
+
+
+def get_cached_calendar_events() -> list[sqlite3.Row]:
+    conn = get_conn()
+    return conn.execute(
+        "SELECT event_id, summary, start, all_day, status, rsvp_status "
+        "FROM calendar_events_cache"
+    ).fetchall()

@@ -57,6 +57,16 @@ _TTS: dict[str, list[tuple[str, str]]] = {
     "elevenlabs": [],   # uses only requests, already in core
 }
 
+# core/calendar_auth.py + core/proactive.py's calendar_event_upcoming
+# trigger — only installed when the user has actually opted in (config's
+# calendar_enabled), not unconditionally like _CORE, since most installs
+# won't use this feature.
+_CALENDAR: list[tuple[str, str]] = [
+    ("google.auth",          "google-auth"),
+    ("google_auth_oauthlib", "google-auth-oauthlib"),
+    ("googleapiclient",      "google-api-python-client"),
+]
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -99,6 +109,8 @@ def install_for_config(config: dict, log: Callable | None = None) -> None:
     needed += _TTS.get(tts, [])
     if platform.system() == "Windows":
         needed += _WINDOWS
+    if config.get("calendar_enabled"):
+        needed += _CALENDAR
 
     # Deduplicate (preserve order, key = pip name)
     seen: set[str] = set()

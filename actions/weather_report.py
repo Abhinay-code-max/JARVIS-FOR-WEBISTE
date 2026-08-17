@@ -10,7 +10,7 @@ def _get_api_key() -> str:
     return load_config().get("openweather_api_key", "").strip()
 
 
-def _log(msg: str, player=None) -> None:
+def _log_msg(msg: str, player=None) -> None:
     _log.debug(f"{msg}")
     if player:
         try:
@@ -29,7 +29,7 @@ def weather_action(
 
     if not city or not isinstance(city, str) or not city.strip():
         msg = "Please specify a city for the weather report."
-        _log(msg, player)
+        _log_msg(msg, player)
         return msg
 
     city = city.strip()
@@ -37,7 +37,7 @@ def weather_action(
 
     if not api_key:
         msg = "Weather API key is not configured. Please add openweather_api_key to config/api_keys.json."
-        _log(msg, player)
+        _log_msg(msg, player)
         return msg
 
     try:
@@ -53,17 +53,17 @@ def weather_action(
 
         if response.status_code == 401:
             msg = "Weather API key is invalid or not yet activated (can take up to 10 minutes after signup)."
-            _log(msg, player)
+            _log_msg(msg, player)
             return msg
 
         if response.status_code == 404:
             msg = f"Could not find weather data for '{city}'. Please check the city name."
-            _log(msg, player)
+            _log_msg(msg, player)
             return msg
 
         if response.status_code != 200:
             msg = f"Weather service returned an error (status {response.status_code})."
-            _log(msg, player)
+            _log_msg(msg, player)
             return msg
 
         data = response.json()
@@ -82,18 +82,18 @@ def weather_action(
             f"Humidity is at {humidity}%, and wind speed is {wind_speed} meters per second."
         )
 
-        _log(f"OK — {city_name}: {temp}°C, {description}", player)
+        _log_msg(f"OK — {city_name}: {temp}°C, {description}", player)
         return result
 
     except requests.exceptions.Timeout:
         msg = "Weather service timed out. Please try again."
-        _log(msg, player)
+        _log_msg(msg, player)
         return msg
     except requests.exceptions.ConnectionError:
         msg = "Could not connect to the weather service. Check your internet connection."
-        _log(msg, player)
+        _log_msg(msg, player)
         return msg
     except Exception as e:
         msg = f"Could not retrieve weather data: {e}"
-        _log(msg, player)
+        _log_msg(msg, player)
         return msg

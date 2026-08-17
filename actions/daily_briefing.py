@@ -106,7 +106,7 @@ def _get_pending_reminders() -> list[str]:
 
 def _get_top_news_headline() -> str:
     try:
-        from duckduckgo_search import DDGS
+        from ddgs import DDGS
         with DDGS() as ddgs:
             results = list(ddgs.news("top world news today", max_results=3))
         if results:

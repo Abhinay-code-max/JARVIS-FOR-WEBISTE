@@ -24,7 +24,8 @@ class WeatherReportLoggerTest(unittest.TestCase):
         self.assertIsInstance(_log, logging.Logger)
         self.assertEqual(_log.name, "jarvis.weather")
 
-    def test_weather_action_logs_to_module_logger(self):
+    @patch("actions.weather_report._get_user_city", return_value="")
+    def test_weather_action_logs_to_module_logger(self, mock_user_city):
         """Calling weather_action must emit log records to jarvis.weather without AttributeError."""
         with self.assertLogs("jarvis.weather", level="DEBUG") as log_ctx:
             result = weather_action({"city": ""})
@@ -32,7 +33,9 @@ class WeatherReportLoggerTest(unittest.TestCase):
 
         self.assertTrue(any("Please specify a city" in rec for rec in log_ctx.output))
 
-    def test_weather_action_logs_to_player_if_provided(self):
+    @patch("actions.weather_report._get_user_city", return_value="")
+    @patch("core.confirm.CONFIRM.request_clarification", return_value=None)
+    def test_weather_action_logs_to_player_if_provided(self, mock_clarify, mock_user_city):
         """When player is provided, player.write_log is called."""
         mock_player = MagicMock()
         with self.assertLogs("jarvis.weather", level="DEBUG"):
@@ -98,6 +101,51 @@ class WeatherReportLoggerTest(unittest.TestCase):
 
         self.assertIn("Weather API key is invalid", result)
         self.assertTrue(any("Weather API key is invalid" in rec for rec in log_ctx.output))
+
+    @patch("actions.weather_report._get_user_city", return_value="Hyderabad")
+    @patch("actions.weather_report._get_api_key", return_value="test_key")
+    @patch("actions.weather_report.requests.get")
+    def test_city_omitted_uses_memory_fallback(self, mock_get, mock_api_key, mock_user_city):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "name": "Hyderabad",
+            "sys": {"country": "IN"},
+            "main": {"temp": 28.0, "feels_like": 30.0, "humidity": 70},
+            "weather": [{"description": "few clouds"}],
+            "wind": {"speed": 4.0},
+        }
+        mock_get.return_value = mock_resp
+
+        result = weather_action({})
+        self.assertIn("Hyderabad, IN", result)
+        mock_get.assert_called_once()
+        self.assertEqual(mock_get.call_args[1]["params"]["q"], "Hyderabad")
+
+    @patch("actions.weather_report._get_user_city", return_value="")
+    @patch("core.confirm.CONFIRM.request_clarification", return_value="Tokyo")
+    @patch("memory.memory_manager.update_memory")
+    @patch("actions.weather_report._get_api_key", return_value="test_key")
+    @patch("actions.weather_report.requests.get")
+    def test_city_omitted_clarifies_with_user_when_memory_empty(
+        self, mock_get, mock_api_key, mock_update_mem, mock_clarify, mock_user_city
+    ):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "name": "Tokyo",
+            "sys": {"country": "JP"},
+            "main": {"temp": 25.0, "feels_like": 26.0, "humidity": 60},
+            "weather": [{"description": "clear sky"}],
+            "wind": {"speed": 2.0},
+        }
+        mock_get.return_value = mock_resp
+        mock_player = MagicMock()
+
+        result = weather_action({}, player=mock_player)
+        self.assertIn("Tokyo, JP", result)
+        mock_clarify.assert_called_once()
+        mock_update_mem.assert_called_once_with({"identity": {"city": "Tokyo"}})
 
 
 if __name__ == "__main__":

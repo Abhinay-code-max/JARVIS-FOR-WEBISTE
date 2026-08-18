@@ -114,21 +114,21 @@ class DispatchToolValidationIntegrationTest(unittest.TestCase):
     def setUp(self):
         _use_temp_db()
         policy.seed_default_policy()
-        self._orig_tool = tdisp.TOOL_DISPATCH.get("weather_report")
-        tdisp.TOOL_DISPATCH["weather_report"] = lambda args, player, speak: "SHOULD NOT RUN"
+        self._orig_tool = tdisp.TOOL_DISPATCH.get("open_app")
+        tdisp.TOOL_DISPATCH["open_app"] = lambda args, player, speak: "SHOULD NOT RUN"
 
     def tearDown(self):
         if self._orig_tool is not None:
-            tdisp.TOOL_DISPATCH["weather_report"] = self._orig_tool
+            tdisp.TOOL_DISPATCH["open_app"] = self._orig_tool
 
     def test_missing_required_param_never_reaches_the_tool(self):
-        result = gate.dispatch_tool("weather_report", {}, player=object(), speak=None)
+        result = gate.dispatch_tool("open_app", {}, player=object(), speak=None)
         self.assertNotEqual(result, "SHOULD NOT RUN")
         self.assertTrue(result.startswith("Rejected — "))
-        self.assertIn("city", result)
+        self.assertIn("app_name", result)
 
     def test_valid_call_reaches_the_tool(self):
-        result = gate.dispatch_tool("weather_report", {"city": "Tokyo"}, player=object(), speak=None)
+        result = gate.dispatch_tool("open_app", {"app_name": "notepad"}, player=object(), speak=None)
         self.assertEqual(result, "SHOULD NOT RUN")  # i.e. it *did* run
 
 

@@ -85,11 +85,16 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "weather_report",
-        "description": "Gets weather for any city.",
+        "description": "Gets weather for any city. If city is omitted, defaults to saved city in memory or asks user.",
         "parameters": {
             "type": "OBJECT",
-            "properties": {"city": {"type": "STRING"}},
-            "required": ["city"]
+            "properties": {
+                "city": {
+                    "type": "STRING",
+                    "description": "Optional. City for the weather report. If omitted, defaults to saved city in memory."
+                }
+            },
+            "required": []
         }
     },
     {

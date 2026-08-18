@@ -25,7 +25,7 @@ def _open_app(parameters, player, speak):
 
 def _weather_report(parameters, player, speak):
     from actions.weather_report import weather_action
-    return weather_action(parameters=parameters, player=player) or "Weather delivered."
+    return weather_action(parameters=parameters, player=player, speak=speak) or "Weather delivered."
 
 
 def _browser_control(parameters, player, speak):

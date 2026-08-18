@@ -362,8 +362,8 @@ class DispatchToolRefactorBehaviorTest(unittest.TestCase):
 
     def test_hard_deny_and_rejected_paths_never_invoke_the_tool(self):
         # validation rejection — never reaches the invoke tail at all
-        calls = self._stub("weather_report")
-        result = gate.dispatch_tool("weather_report", {}, player=None, speak=None, task_id="t-rej")
+        calls = self._stub("open_app")
+        result = gate.dispatch_tool("open_app", {}, player=None, speak=None, task_id="t-rej")
         self.assertEqual(len(calls), 0)
         self.assertTrue(result.startswith("Rejected — "))
 

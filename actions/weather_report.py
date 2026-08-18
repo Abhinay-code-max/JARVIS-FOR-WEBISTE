@@ -19,13 +19,71 @@ def _log_msg(msg: str, player=None) -> None:
             pass
 
 
+def _get_user_city() -> str:
+    """
+    Pull the user's saved city from memory.
+    Checks top-level 'city' key and 'identity.city' / 'identity.location'.
+    """
+    try:
+        from actions.daily_briefing import _get_user_city as _briefing_city
+        city = _briefing_city()
+        if city:
+            return city
+    except Exception:
+        pass
+
+    try:
+        from memory.memory_manager import load_memory
+        mem = load_memory()
+        if "city" in mem:
+            val = mem["city"]
+            if isinstance(val, dict):
+                val = val.get("value", "")
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        identity = mem.get("identity", {})
+        for key in ("city", "location"):
+            if key in identity:
+                val = identity[key]
+                if isinstance(val, dict):
+                    val = val.get("value", "")
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+    except Exception:
+        pass
+    return ""
+
+
 def weather_action(
-    parameters: dict,
+    parameters: dict = None,
     player=None,
+    speak=None,
     session_memory=None,
 ) -> str:
-    city = parameters.get("city")
-    when = parameters.get("time", "today")
+    params = parameters or {}
+    city = params.get("city")
+    when = params.get("time", "today")
+
+    if not city or not isinstance(city, str) or not city.strip():
+        # Fallback 1: check memory
+        city = _get_user_city()
+
+    if not city or not isinstance(city, str) or not city.strip():
+        # Fallback 2: clarify with user if live player is present
+        if player is not None:
+            try:
+                from core.confirm import CONFIRM
+                prompt = "Which city would you like the weather report for, sir?"
+                answer = CONFIRM.request_clarification(player, prompt, speak=speak)
+                if answer and isinstance(answer, str) and answer.strip():
+                    city = answer.strip()
+                    try:
+                        from memory.memory_manager import update_memory
+                        update_memory({"identity": {"city": city}})
+                    except Exception as e:
+                        _log.warning("Could not save city to memory: %s", e)
+            except Exception as e:
+                _log.warning("Clarification fallback error: %s", e)
 
     if not city or not isinstance(city, str) or not city.strip():
         msg = "Please specify a city for the weather report."

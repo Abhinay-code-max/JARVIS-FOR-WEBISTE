@@ -220,7 +220,6 @@ def _launch_windows(target: str | dict, raw_app_name: str = "") -> bool:
             if protocol:
                 try:
                     subprocess.Popen(["cmd", "/c", "start", "", protocol])
-                    time.sleep(1.0)
                     return True
                 except Exception as e:
                     _log.debug(f"Protocol launch failed for {protocol}: {e}")
@@ -228,7 +227,6 @@ def _launch_windows(target: str | dict, raw_app_name: str = "") -> bool:
             if aumid:
                 try:
                     subprocess.Popen(["explorer.exe", f"shell:AppsFolder\\{aumid}"])
-                    time.sleep(1.0)
                     return True
                 except Exception as e:
                     _log.debug(f"AUMID launch failed for {aumid}: {e}")
@@ -239,7 +237,6 @@ def _launch_windows(target: str | dict, raw_app_name: str = "") -> bool:
             if path_val and os.path.isfile(path_val):
                 try:
                     subprocess.Popen([path_val], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    time.sleep(0.8)
                     return True
                 except Exception as e:
                     _log.warning(f"Config path launch failed for {path_val}: {e}")
@@ -250,7 +247,6 @@ def _launch_windows(target: str | dict, raw_app_name: str = "") -> bool:
         if os.path.isfile(target):
             try:
                 subprocess.Popen([target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                time.sleep(0.8)
                 return True
             except Exception as e:
                 _log.warning(f"File path launch failed for {target}: {e}")
@@ -259,7 +255,6 @@ def _launch_windows(target: str | dict, raw_app_name: str = "") -> bool:
         if target.endswith(":") or (":" in target and "\\" not in target and "/" not in target):
             try:
                 subprocess.Popen(["cmd", "/c", "start", "", target])
-                time.sleep(1.0)
                 return True
             except Exception:
                 pass
@@ -269,7 +264,6 @@ def _launch_windows(target: str | dict, raw_app_name: str = "") -> bool:
         if probed:
             try:
                 subprocess.Popen([probed], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                time.sleep(0.8)
                 return True
             except Exception as e:
                 _log.warning(f"Probed path launch failed for {probed}: {e}")
@@ -281,7 +275,6 @@ def _launch_windows(target: str | dict, raw_app_name: str = "") -> bool:
         if resolved:
             try:
                 subprocess.Popen([resolved], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                time.sleep(0.8)
                 return True
             except Exception as e:
                 _log.warning(f"PATH launch failed for {resolved}: {e}")

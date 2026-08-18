@@ -369,6 +369,29 @@ class ElevenLabsTTSEngine:
 # Thread-safe player wrapper
 # ---------------------------------------------------------------------------
 
+import re
+
+_EMOJI_PATTERN = re.compile(
+    "["
+    "\U00010000-\U0010ffff"  # Supplementary Multilingual Plane (all modern emojis)
+    "\u2600-\u27bf"          # Misc symbols & Dingbats (☀️, ✈️, ✂️, etc.)
+    "\u2300-\u23ff"          # Misc Technical (⌚, ⏰, etc.)
+    "\u2b50-\u2b55"          # Stars & circles
+    "\u200d"                 # Zero-width joiner
+    "\ufe0f"                 # Variation selector-16 (emoji presentation)
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+def _strip_emojis(text: str) -> str:
+    """Strip Unicode emojis and pictographs so TTS engines don't read them literally."""
+    if not text or not isinstance(text, str):
+        return ""
+    cleaned = _EMOJI_PATTERN.sub("", text)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
 class TTSPlayer:
     """
     Wraps any *Engine. Exposes a blocking speak() method
@@ -391,12 +414,18 @@ class TTSPlayer:
         on_done:  Optional[Callable] = None,
     ) -> None:
         """Synthesise and play text. BLOCKING – call from a dedicated thread."""
+        clean_text = _strip_emojis(text)
+        if not clean_text:
+            if on_done:
+                on_done()
+            return
+
         try:
             with self._lock:
                 self._playing = True
             if on_start:
                 on_start()
-            self._engine.speak(text)
+            self._engine.speak(clean_text)
         except Exception as e:
             _log.error("Error: %s", e)
         finally:

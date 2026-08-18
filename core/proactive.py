@@ -223,6 +223,9 @@ class ProactiveLoop:
         # from calendar's own timer so one sync's cadence never affects
         # the other's.
         self._last_ci_sync: float = 0.0
+        # Watermark flag: on first sync, existing runs are recorded as baseline
+        # so historical runs are not spoken unprompted on startup.
+        self._ci_synced_once: bool = False
         self._running = False
 
     def _gated_speak(self, text: str) -> bool:
@@ -432,6 +435,8 @@ class ProactiveLoop:
             "X-GitHub-Api-Version": _GITHUB_API_VERSION,
         }
 
+        is_first_sync = not self._ci_synced_once
+        synced_any = False
         for repo in CI_REPOS:
             try:
                 resp = requests.get(
@@ -444,7 +449,19 @@ class ProactiveLoop:
                 _log.warning("CI sync failed for %s — serving last-known cache", repo, exc_info=True)
                 continue
 
-            replace_ci_cache(repo, [_parse_ci_run(item) for item in items])
+            parsed_runs = [_parse_ci_run(item) for item in items]
+            replace_ci_cache(repo, parsed_runs)
+            synced_any = True
+
+            if is_first_sync:
+                for r in parsed_runs:
+                    if r["status"] == "completed" and r["conclusion"] in ("success", "failure"):
+                        ref_id = f"{r['run_id']}:{r['conclusion']}"
+                        if not nudge_already_sent(TRIGGER_CI_RUN, ref_id):
+                            record_nudge(TRIGGER_CI_RUN, ref_id)
+
+        if synced_any:
+            self._ci_synced_once = True
 
     @staticmethod
     def _ci_outcome_word(conclusion: str) -> str:

@@ -1110,6 +1110,72 @@ class TickCadenceTest(ProactiveTestCase):
         self.assertEqual(len(calendar_calls), 2)
         self.assertEqual(len(ci_calls), 2)
 
+    def test_first_sync_watermarks_historical_runs_without_speaking(self):
+        """Historical runs present on first sync are recorded as baseline and not spoken."""
+        cfg = {"github_ci_enabled": True}
+        historical_item_1 = {
+            "id": 101,
+            "name": "CI",
+            "display_title": "old historical commit 1",
+            "head_branch": "main",
+            "head_sha": "abc1",
+            "status": "completed",
+            "conclusion": "success",
+            "html_url": "https://github.com/example/runs/101",
+        }
+        historical_item_2 = {
+            "id": 201,
+            "name": "CI",
+            "display_title": "old historical commit 2",
+            "head_branch": "main",
+            "head_sha": "abc2",
+            "status": "completed",
+            "conclusion": "success",
+            "html_url": "https://github.com/example/runs/201",
+        }
+        loop = _RecordingLoop()
+
+        def _first_get(url, *args, **kwargs):
+            if proactive.CI_REPOS[0] in url:
+                return _FakeGithubResponse({"workflow_runs": [historical_item_1]})
+            return _FakeGithubResponse({"workflow_runs": [historical_item_2]})
+
+        with patch.object(proactive, "load_config", lambda: cfg), \
+             patch("core.github_ci_auth.get_github_token", return_value="fake_pat"), \
+             patch("requests.get", side_effect=_first_get):
+            loop._sync_ci()
+            loop._check_ci_runs()
+
+        # Zero messages spoken on initial startup
+        self.assertEqual(loop.spoken, [])
+
+        # Now simulate a NEW run completing in the next sync tick
+        new_item = {
+            "id": 102,
+            "name": "CI",
+            "display_title": "brand new commit",
+            "head_branch": "main",
+            "head_sha": "abc3",
+            "status": "completed",
+            "conclusion": "success",
+            "html_url": "https://github.com/example/runs/102",
+        }
+
+        def _second_get(url, *args, **kwargs):
+            if proactive.CI_REPOS[0] in url:
+                return _FakeGithubResponse({"workflow_runs": [new_item, historical_item_1]})
+            return _FakeGithubResponse({"workflow_runs": [historical_item_2]})
+
+        with patch.object(proactive, "load_config", lambda: cfg), \
+             patch("core.github_ci_auth.get_github_token", return_value="fake_pat"), \
+             patch("requests.get", side_effect=_second_get):
+            loop._sync_ci()
+            loop._check_ci_runs()
+
+        # The new run DOES get announced
+        self.assertEqual(len(loop.spoken), 1)
+        self.assertIn("brand new commit", loop.spoken[0])
+
 
 if __name__ == "__main__":
     unittest.main()

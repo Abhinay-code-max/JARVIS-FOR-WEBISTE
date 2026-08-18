@@ -63,7 +63,8 @@ class WebSearchTest(unittest.TestCase):
         self.assertIn("Search results for: my query", formatted)
         self.assertIn("1. First", formatted)
         self.assertIn("   First snippet", formatted)
-        self.assertIn("   https://first.com", formatted)
+        self.assertNotIn("https://first.com", formatted)
+        self.assertNotIn("https://second.com", formatted)
         self.assertIn("2. Second", formatted)
 
     def test_web_search_empty_params(self):

@@ -29,7 +29,6 @@ def _format_ddg(query: str, results: list[dict]) -> str:
     for i, r in enumerate(results, 1):
         if r.get("title"):   lines.append(f"{i}. {r['title']}")
         if r.get("snippet"): lines.append(f"   {r['snippet']}")
-        if r.get("url"):     lines.append(f"   {r['url']}")
         lines.append("")
     return "\n".join(lines).strip()
 
@@ -38,13 +37,14 @@ def _llm_summarize(query: str, raw_results: str) -> str:
     try:
         from core.llm_client import call_llm_text
         system = (
-            "You are JARVIS. Summarize web search results clearly and concisely. "
-            "Answer the user's query directly. Be factual. Address user as 'sir'."
+            "You are JARVIS. Summarize web search results clearly and concisely for voice output. "
+            "Answer the user's query directly. Be factual. Address user as 'sir'. "
+            "Do not recite URLs or website links."
         )
         prompt = (
             f"User question: {query}\n\n"
             f"Web search results:\n{raw_results[:4000]}\n\n"
-            "Answer the question based on these results:"
+            "Answer the question based on these results (spoken summary only, no URLs):"
         )
         return call_llm_text(prompt, system=system)
     except Exception:

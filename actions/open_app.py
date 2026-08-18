@@ -1,8 +1,12 @@
+import os
+import json
 import time
 import subprocess
 import platform
 import shutil
 import logging
+
+from config import BASE_DIR
 
 _log = logging.getLogger("jarvis.open_app")
 
@@ -23,7 +27,7 @@ _APP_ALIASES: dict[str, dict[str, str]] = {
     "brave":              {"Windows": "brave",                   "Darwin": "Brave Browser",        "Linux": "brave-browser"},
     "safari":             {"Windows": "msedge",                  "Darwin": "Safari",               "Linux": "firefox"},
     "opera":              {"Windows": "opera",                   "Darwin": "Opera",                "Linux": "opera"},
-    "whatsapp":           {"Windows": "whatsapp:",                "Darwin": "WhatsApp",             "Linux": "whatsapp"},
+    "whatsapp":           {"Windows": "whatsapp:",               "Darwin": "WhatsApp",             "Linux": "whatsapp"},
     "telegram":           {"Windows": "Telegram",                "Darwin": "Telegram",             "Linux": "telegram"},
     "discord":            {"Windows": "Discord",                 "Darwin": "Discord",              "Linux": "discord"},
     "slack":              {"Windows": "Slack",                   "Darwin": "Slack",                "Linux": "slack"},
@@ -68,9 +72,31 @@ _APP_ALIASES: dict[str, dict[str, str]] = {
 }
 
 
-def _normalize(raw: str) -> str:
+def _load_app_paths() -> dict:
+    p = BASE_DIR / "config" / "app_paths.json"
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return {k.lower().strip(): v for k, v in data.items()}
+    except Exception as e:
+        _log.warning("Could not load config/app_paths.json: %s", e)
+    return {}
+
+
+def _normalize(raw: str) -> str | dict:
     key = raw.lower().strip()
 
+    # 1. Custom app_paths.json lookup
+    custom_paths = _load_app_paths()
+    if key in custom_paths:
+        return custom_paths[key]
+    for ck, cv in custom_paths.items():
+        if ck in key or key in ck:
+            return cv
+
+    # 2. Built-in alias map
     if key in _APP_ALIASES:
         return _APP_ALIASES[key].get(_SYSTEM, raw)
 
@@ -78,63 +104,212 @@ def _normalize(raw: str) -> str:
         if alias_key in key or key in alias_key:
             return os_map.get(_SYSTEM, raw)
 
-    return raw  
+    return raw
 
-def _launch_windows(app_name: str) -> bool:
 
-    resolved = shutil.which(app_name) or shutil.which(app_name.split(".")[0])
-    if resolved:
+def _probe_windows_exe(app_name: str) -> str | None:
+    """Probes well-known Windows installation directories for common applications."""
+    key = app_name.lower().strip()
+
+    known_probes = {
+        "chrome": [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+        ],
+        "google chrome": [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+        ],
+        "firefox": [
+            r"C:\Program Files\Mozilla Firefox\firefox.exe",
+            r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe",
+        ],
+        "edge": [
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        ],
+        "msedge": [
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        ],
+        "brave": [
+            r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\BraveSoftware\Brave-Browser\Application\brave.exe"),
+        ],
+        "spotify": [
+            os.path.expandvars(r"%APPDATA%\Spotify\Spotify.exe"),
+            os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WindowsApps\Spotify.exe"),
+        ],
+        "discord": [
+            os.path.expandvars(r"%LOCALAPPDATA%\Discord\Update.exe"),
+        ],
+        "telegram": [
+            os.path.expandvars(r"%APPDATA%\Telegram Desktop\Telegram.exe"),
+            r"C:\Program Files\Telegram Desktop\Telegram.exe",
+        ],
+        "vscode": [
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\Microsoft VS Code\Code.exe"),
+            r"C:\Program Files\Microsoft VS Code\Code.exe",
+        ],
+        "visual studio code": [
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\Microsoft VS Code\Code.exe"),
+            r"C:\Program Files\Microsoft VS Code\Code.exe",
+        ],
+        "code": [
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\Microsoft VS Code\Code.exe"),
+            r"C:\Program Files\Microsoft VS Code\Code.exe",
+        ],
+        "notepad": [
+            r"C:\Windows\notepad.exe",
+            r"C:\Windows\System32\notepad.exe",
+        ],
+        "notepad.exe": [
+            r"C:\Windows\notepad.exe",
+            r"C:\Windows\System32\notepad.exe",
+        ],
+        "explorer": [
+            r"C:\Windows\explorer.exe",
+        ],
+        "task manager": [
+            r"C:\Windows\System32\taskmgr.exe",
+        ],
+        "calc": [
+            r"C:\Windows\System32\calc.exe",
+        ],
+        "calculator": [
+            r"C:\Windows\System32\calc.exe",
+        ],
+        "paint": [
+            r"C:\Windows\System32\mspaint.exe",
+        ],
+    }
+
+    if key in known_probes:
+        for candidate in known_probes[key]:
+            if os.path.isfile(candidate):
+                return candidate
+
+    # Generic probing in Programs directories
+    base_dirs = [
+        os.path.expandvars(r"%LOCALAPPDATA%\Programs"),
+        os.environ.get("ProgramFiles", r"C:\Program Files"),
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+    ]
+    app_base = key.replace(".exe", "")
+    for b in base_dirs:
+        if not b or not os.path.isdir(b):
+            continue
+        direct_exe = os.path.join(b, f"{app_base}.exe")
+        if os.path.isfile(direct_exe):
+            return direct_exe
+        nested_exe = os.path.join(b, app_base, f"{app_base}.exe")
+        if os.path.isfile(nested_exe):
+            return nested_exe
+
+    return None
+
+
+def _launch_windows(target: str | dict, raw_app_name: str = "") -> bool:
+    # 1. Structure configuration (e.g. UWP protocol/AUMID from app_paths.json)
+    if isinstance(target, dict):
+        app_type = target.get("type", "path").lower()
+        if app_type == "uwp":
+            protocol = target.get("protocol")
+            if protocol:
+                try:
+                    subprocess.Popen(["cmd", "/c", "start", "", protocol])
+                    time.sleep(1.0)
+                    return True
+                except Exception as e:
+                    _log.debug(f"Protocol launch failed for {protocol}: {e}")
+            aumid = target.get("aumid")
+            if aumid:
+                try:
+                    subprocess.Popen(["explorer.exe", f"shell:AppsFolder\\{aumid}"])
+                    time.sleep(1.0)
+                    return True
+                except Exception as e:
+                    _log.debug(f"AUMID launch failed for {aumid}: {e}")
+            return False
+
+        elif app_type == "path":
+            path_val = target.get("path", "")
+            if path_val and os.path.isfile(path_val):
+                try:
+                    subprocess.Popen([path_val], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    time.sleep(0.8)
+                    return True
+                except Exception as e:
+                    _log.warning(f"Config path launch failed for {path_val}: {e}")
+
+    # 2. String target resolution
+    if isinstance(target, str):
+        # Direct file path
+        if os.path.isfile(target):
+            try:
+                subprocess.Popen([target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                time.sleep(0.8)
+                return True
+            except Exception as e:
+                _log.warning(f"File path launch failed for {target}: {e}")
+
+        # Protocol URI (e.g. "whatsapp:", "ms-settings:")
+        if target.endswith(":") or (":" in target and "\\" not in target and "/" not in target):
+            try:
+                subprocess.Popen(["cmd", "/c", "start", "", target])
+                time.sleep(1.0)
+                return True
+            except Exception:
+                pass
+
+        # Standard installation directory probing
+        probed = _probe_windows_exe(target) or (raw_app_name and _probe_windows_exe(raw_app_name))
+        if probed:
+            try:
+                subprocess.Popen([probed], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                time.sleep(0.8)
+                return True
+            except Exception as e:
+                _log.warning(f"Probed path launch failed for {probed}: {e}")
+
+        # PATH resolution via shutil.which
+        resolved = shutil.which(target) or shutil.which(target.split(".")[0])
+        if not resolved and raw_app_name:
+            resolved = shutil.which(raw_app_name) or shutil.which(raw_app_name.split(".")[0])
+        if resolved:
+            try:
+                subprocess.Popen([resolved], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                time.sleep(0.8)
+                return True
+            except Exception as e:
+                _log.warning(f"PATH launch failed for {resolved}: {e}")
+
+    # 3. Fallback to Start Menu search via PyAutoGUI
+    search_term = raw_app_name or (target if isinstance(target, str) else "")
+    if search_term and not str(search_term).endswith(":"):
         try:
-            # Launch the resolved executable path directly as a single
-            # argv element — no shell involved, so no shell metacharacter
-            # in app_name (&, |, >, ...) can inject a second command.
-            subprocess.Popen(
-                [resolved],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            time.sleep(0.8)
+            import pyautogui
+            pyautogui.PAUSE = 0.1
+            pyautogui.press("win")
+            time.sleep(0.7)
+            pyautogui.write(search_term, interval=0.05)
+            time.sleep(0.9)
+            pyautogui.press("enter")
+            time.sleep(1.2)
             return True
         except Exception as e:
-            _log.warning(f"subprocess failed: {e}")
-
-    if ":" in app_name:
-        try:
-            # "start" is a cmd.exe builtin, not a real executable, so it
-            # can't be launched without going through cmd — but passing
-            # app_name as its own list element (rather than string-
-            # interpolating it into a shell command) means cmd receives it
-            # as a single literal argument, not shell-parsed text. The
-            # empty "" is the conventional placeholder "start" needs for
-            # its optional window-title argument when the target itself
-            # might contain spaces.
-            subprocess.Popen(["cmd", "/c", "start", "", app_name])
-            time.sleep(1.0)
-            return True
-        except Exception:
-            pass
-
-    try:
-        import pyautogui
-        pyautogui.PAUSE = 0.1
-        pyautogui.press("win")
-        time.sleep(0.7)
-        pyautogui.write(app_name, interval=0.05)
-        time.sleep(0.9)
-        pyautogui.press("enter")
-        time.sleep(1.2)
-        return True
-    except Exception as e:
-        _log.warning(f"Start Menu search failed: {e}")
+            _log.warning(f"Start Menu search failed: {e}")
 
     return False
 
 
 def _launch_macos(app_name: str) -> bool:
-
+    target = app_name if isinstance(app_name, str) else str(app_name)
     try:
         result = subprocess.run(
-            ["open", "-a", app_name],
+            ["open", "-a", target],
             capture_output=True, timeout=8
         )
         if result.returncode == 0:
@@ -145,7 +320,7 @@ def _launch_macos(app_name: str) -> bool:
 
     try:
         result = subprocess.run(
-            ["open", "-a", f"{app_name}.app"],
+            ["open", "-a", f"{target}.app"],
             capture_output=True, timeout=8
         )
         if result.returncode == 0:
@@ -154,7 +329,7 @@ def _launch_macos(app_name: str) -> bool:
     except Exception:
         pass
 
-    binary = shutil.which(app_name) or shutil.which(app_name.lower())
+    binary = shutil.which(target) or shutil.which(target.lower())
     if binary:
         try:
             subprocess.Popen(
@@ -171,7 +346,7 @@ def _launch_macos(app_name: str) -> bool:
         import pyautogui
         pyautogui.hotkey("command", "space")
         time.sleep(0.3)
-        pyautogui.write(app_name, interval=0.05)
+        pyautogui.write(target, interval=0.05)
         time.sleep(0.8)
         pyautogui.press("enter")
         time.sleep(0.8)
@@ -183,12 +358,12 @@ def _launch_macos(app_name: str) -> bool:
 
 
 def _launch_linux(app_name: str) -> bool:
-
+    target = app_name if isinstance(app_name, str) else str(app_name)
     binary = (
-        shutil.which(app_name) or
-        shutil.which(app_name.lower()) or
-        shutil.which(app_name.lower().replace(" ", "-")) or
-        shutil.which(app_name.lower().replace(" ", "_"))
+        shutil.which(target) or
+        shutil.which(target.lower()) or
+        shutil.which(target.lower().replace(" ", "-")) or
+        shutil.which(target.lower().replace(" ", "_"))
     )
     if binary:
         try:
@@ -204,7 +379,7 @@ def _launch_linux(app_name: str) -> bool:
 
     try:
         subprocess.run(
-            ["xdg-open", app_name],
+            ["xdg-open", target],
             capture_output=True, timeout=5
         )
         return True
@@ -212,9 +387,9 @@ def _launch_linux(app_name: str) -> bool:
         pass
 
     for desktop_name in [
-        app_name.lower(),
-        app_name.lower().replace(" ", "-"),
-        app_name.lower().replace(" ", ""),
+        target.lower(),
+        target.lower().replace(" ", "-"),
+        target.lower().replace(" ", ""),
     ]:
         try:
             result = subprocess.run(
@@ -257,11 +432,18 @@ def open_app(
         player.write_log(f"[open_app] {app_name}")
 
     try:
-        if launcher(normalized):
-            return f"Opened {app_name}."
-        if normalized.lower() != app_name.lower():
-            if launcher(app_name):
+        if _SYSTEM == "Windows":
+            if _launch_windows(normalized, raw_app_name=app_name):
                 return f"Opened {app_name}."
+            if isinstance(normalized, str) and normalized.lower() != app_name.lower():
+                if _launch_windows(app_name, raw_app_name=app_name):
+                    return f"Opened {app_name}."
+        else:
+            if launcher(normalized if isinstance(normalized, str) else app_name):
+                return f"Opened {app_name}."
+            if isinstance(normalized, str) and normalized.lower() != app_name.lower():
+                if launcher(app_name):
+                    return f"Opened {app_name}."
         return (
             f"Could not confirm that {app_name} launched. "
             f"It may still be loading, or it might not be installed."

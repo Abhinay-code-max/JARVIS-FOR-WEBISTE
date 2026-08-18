@@ -18,7 +18,9 @@ Supports two backends — selected via  "llm_provider"  in config/api_keys.json:
 """
 import json
 import logging
+import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -44,6 +46,29 @@ _DEFAULTS = {
 
 def _elapsed_ms(start: float) -> int:
     return int((time.monotonic() - start) * 1000)
+
+
+def _disable_thinking(payload: dict) -> dict:
+    """Ollama-native `think` field, set on every Ollama-backend request
+    payload (not the OpenAI-compatible path — `think` has no equivalent
+    there). Hybrid-reasoning models such as Nemotron-3-Nano emit their
+    reasoning trace in a separate `message.thinking` field, never inline
+    in `message.content` — confirmed live: content is clean in both
+    streaming and non-streaming responses, so no stripping of content is
+    needed or possible.
+
+    The real risk is that `thinking` and `content` draw from the same
+    `num_predict` budget. This codebase's existing budgets (150/500/600)
+    were sized for non-reasoning models where every generated token was
+    already the answer. Live-tested against nemotron-3-nano:4b at
+    num_predict=600: a verbose reasoning pass consumed the entire budget
+    before any content was emitted in 2 of 5 trials (done_reason="length",
+    content empty or truncated mid-code). `think: false` avoids this by
+    skipping the reasoning pass entirely — confirmed a harmless no-op on
+    non-thinking models (e.g. qwen2.5:3b), so this is safe to set
+    unconditionally regardless of which model is configured."""
+    payload["think"] = False
+    return payload
 
 
 def _log_llm_outcome(
@@ -123,7 +148,13 @@ def ensure_ollama_running(timeout: int = 15) -> bool:
         kwargs: dict = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
         if sys.platform == "win32":
             kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-        subprocess.Popen(["ollama", "serve"], **kwargs)
+        ollama_bin = (
+            shutil.which("ollama") or
+            (os.path.expandvars(r"%LOCALAPPDATA%\Programs\Ollama\ollama.exe") if os.path.isfile(os.path.expandvars(r"%LOCALAPPDATA%\Programs\Ollama\ollama.exe")) else None) or
+            (r"C:\Program Files\Ollama\ollama.exe" if os.path.isfile(r"C:\Program Files\Ollama\ollama.exe") else None) or
+            "ollama"
+        )
+        subprocess.Popen([ollama_bin, "serve"], **kwargs)
     except FileNotFoundError:
         _log.error("'ollama' command not found. Install Ollama from https://ollama.com")
         return False
@@ -185,7 +216,7 @@ def warmup_model(system_prompt: str | None = None) -> bool:
             return False
 
     # ── Ollama ──────────────────────────────────────────────────────────────
-    payload = {
+    payload = _disable_thinking({
         "model":      model,
         "messages":   messages,
         "stream":     False,
@@ -193,7 +224,7 @@ def warmup_model(system_prompt: str | None = None) -> bool:
         # num_gpu:99 → push ALL transformer layers to GPU (Ollama caps at available)
         # This is safe even without a GPU — Ollama silently ignores if n_gpu_layers=0
         "options":    {"num_predict": 1, "num_gpu": 99},
-    }
+    })
     try:
         resp = requests.post(f"{url}/api/chat", json=payload, timeout=180)
         resp.raise_for_status()
@@ -294,13 +325,13 @@ def _call_llm_impl(
     # 150 tokens is sized for a spoken reply; a tool call still has to fit
     # its name + JSON arguments in that same budget, so give tool-bearing
     # requests more headroom (500) to avoid truncating mid-JSON.
-    payload = {
+    payload = _disable_thinking({
         "model":      model,
         "messages":   messages,
         "stream":     False,
         "keep_alive": -1,
         "options":    {"num_predict": 500 if tools else 150, "num_gpu": 99},
-    }
+    })
     if tools:
         payload["tools"] = tools
 
@@ -381,7 +412,9 @@ def _call_llm_text_impl(
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
-    payload = {"model": m, "messages": messages, "stream": False, "keep_alive": -1, "options": {"num_predict": 600}}
+    payload = _disable_thinking(
+        {"model": m, "messages": messages, "stream": False, "keep_alive": -1, "options": {"num_predict": 600}}
+    )
 
     try:
         resp = requests.post(endpoint, json=payload, timeout=timeout)
@@ -448,12 +481,12 @@ def _call_llm_vision_impl(
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt, "images": [b64]})
 
-    payload = {
+    payload = _disable_thinking({
         "model":      m,
         "stream":     False,
         "keep_alive": -1,
         "messages":   messages,
-    }
+    })
     try:
         resp = requests.post(f"{url}/api/chat", json=payload, timeout=timeout)
         resp.raise_for_status()
@@ -631,7 +664,7 @@ def _call_llm_stream_impl(
     url, model = get_llm_settings()
     endpoint   = f"{url}/api/chat"
 
-    payload: dict = {
+    payload: dict = _disable_thinking({
         "model":      model,
         "messages":   messages,
         "stream":     True,
@@ -645,7 +678,7 @@ def _call_llm_stream_impl(
         # 500 via natural stop tokens — this is a ceiling, not a target.
         # num_gpu:99 pushes all layers to GPU; num_thread removed (Ollama auto-tunes).
         "options":    {"num_predict": 500 if tools else 150, "num_gpu": 99},
-    }
+    })
     if tools:
         payload["tools"] = tools
 

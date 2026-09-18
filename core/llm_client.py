@@ -39,7 +39,7 @@ _SENT_END = re.compile(r'(?<=[.!?])\s+|(?<=\n)\s*\n')
 
 _DEFAULTS = {
     "llm_url":      "http://localhost:11434",
-    "llm_model":    "llama3.2",
+    "llm_model":    "nemotron-3-nano:4b",
     "llm_provider": "ollama",   # "ollama" | "openai"
 }
 

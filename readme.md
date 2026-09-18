@@ -56,7 +56,7 @@ Microphone → STT (Whisper / Vosk)
 ## Requirements
 
 - Python 3.11 or 3.12
-- [Ollama](https://ollama.com) installed and a model pulled (e.g. `ollama pull qwen2.5:7b`)
+- [Ollama](https://ollama.com) installed and a model pulled (e.g. `ollama pull nemotron-3-nano:4b`)
 - A microphone
 
 ---
@@ -66,7 +66,7 @@ Microphone → STT (Whisper / Vosk)
 ```bash
 # 1. Install Ollama → https://ollama.com
 #    Then pull a model:
-ollama pull qwen2.5:7b
+ollama pull nemotron-3-nano:4b
 
 # 2. Clone / download the project and launch (Windows):
 start_jarvis.bat
@@ -92,7 +92,7 @@ After setup, use the **⚙ CONFIGURE** button in the right panel to change any s
     "stt_model":          "base",
     "stt_language":       "auto",
     "llm_url":            "http://localhost:11434",
-    "llm_model":          "qwen2.5:7b",
+    "llm_model":          "nemotron-3-nano:4b",
     "tts_engine":         "edgetts",
     "tts_voice":          "en-US-GuyNeural",
     "elevenlabs_api_key": ""
@@ -105,7 +105,7 @@ After setup, use the **⚙ CONFIGURE** button in the right panel to change any s
 | `stt_model` | `tiny` / `base` / `small` / `medium` / `large-v3` | `base` |
 | `stt_language` | `auto` or ISO code (`tr`, `en`, `de` …) | `auto` |
 | `llm_url` | Ollama API base URL | `http://localhost:11434` |
-| `llm_model` | Any model pulled in Ollama | `qwen2.5:7b` |
+| `llm_model` | Any model pulled in Ollama | `nemotron-3-nano:4b` |
 | `tts_engine` | `edgetts` / `kokoro` / `elevenlabs` | `edgetts` |
 | `tts_voice` | Voice name / ID depending on engine | `en-US-GuyNeural` |
 

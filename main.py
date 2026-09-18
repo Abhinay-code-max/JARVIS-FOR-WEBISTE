@@ -124,6 +124,7 @@ CHANNELS        = 1
 # agent/planner.py's PLANNER_PROMPT is generated from it too, instead of
 # each maintaining its own independently-drifting copy.
 from core.tool_declarations import TOOL_DECLARATIONS, OLLAMA_TOOLS
+from core.intent_classifier import is_pure_conversational
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -242,10 +243,11 @@ class JarvisXL:
     MAX_HISTORY     = 20   # turns (up from 10 in MARK XL)
     MAX_TOOL_ROUNDS = 6
     WAKE_WINDOW_SEC = 15.0  # how long JARVIS stays "awake" after the wake word / last command, before requiring it again
+    WAKE_GRACE_SEC  = 5.0   # grace window after JARVIS finishes speaking — no wake word needed for a follow-up
 
     def __init__(self, ui: JarvisUI):
         self.ui                = ui
-        self._config           = load_config()
+        self._config           = dict(load_config())
         self._stt              = None
         self._tts              = None
         self._tts_ready        = threading.Event()
@@ -303,6 +305,9 @@ class JarvisXL:
         self._last_command_text:  str   = ""
         self._last_command_time:  float = 0.0
         self._dedup_window_sec:   float = 2.5
+
+        # System readiness state (set after warmup + STT loading complete)
+        self._is_ready: threading.Event = threading.Event()
 
         self._proactive = ProactiveLoop(
             speak       = self.speak,
@@ -379,8 +384,24 @@ class JarvisXL:
                         self._speaking = False
                         if not was_barge_in:
                             self._speech_end_time = time.time() + self._echo_grace_sec
+                            # ── Post-response wake grace window ───────────────
+                            # Open the wake gate for WAKE_GRACE_SEC after JARVIS
+                            # finishes speaking so the user can ask a natural
+                            # follow-up without re-saying "Hey JARVIS". Barge-ins
+                            # already bypass _wake_gate via _barge_in_pending so
+                            # they don't need this path. If _wake_until is already
+                            # further in the future (still within an active awake
+                            # window from a prior command), don't shorten it —
+                            # only extend, never shrink.
+                            grace_end = time.time() + self.WAKE_GRACE_SEC
+                            if grace_end > self._wake_until:
+                                self._wake_until = grace_end
+                            _wake_log.debug(
+                                "Post-response grace: wake gate open until %.1fs from now",
+                                self._wake_until - time.time(),
+                            )
                         # else: a barge-in already zeroed _speech_end_time —
-                        # don't re-arm the grace window right on top of it,
+                        # don't re-arm the echo grace window right on top of it,
                         # that would re-gate the mic immediately after the
                         # interruption we just made room for.
                     if not self.ui.muted:
@@ -477,6 +498,15 @@ class JarvisXL:
             return text
         if not self._wake.check(text):
             _wake_log.debug("Gate: no wake word, dropped: %r", text)
+            self.ui.write_log(f"🔒 Heard: \"{text}\" — say 'Hey JARVIS' to activate")
+            self.ui.set_state("LOCKED (SAY 'HEY JARVIS')")
+            def _revert_lock():
+                cur_state = getattr(self.ui, "state", None)
+                if isinstance(cur_state, str) and cur_state != "LOCKED (SAY 'HEY JARVIS')":
+                    return
+                if not self.ui.muted and self._is_ready.is_set() and not self._speaking:
+                    self.ui.set_state("LISTENING")
+            threading.Timer(2.0, _revert_lock).start()
             return None
         self._wake_until = now + self.WAKE_WINDOW_SEC
         _wake_log.info("Gate: wake word matched, window opened")
@@ -508,6 +538,10 @@ class JarvisXL:
                 return
             self._last_produced_text = normalized
             self._last_produced_time = now
+
+        if not self._is_ready.is_set():
+            self.ui.write_log(f"⏳ Starting up — queued: \"{text}\"")
+
         self._text_queue.put(text)
 
     def _on_text_command(self, text: str) -> None:
@@ -548,9 +582,16 @@ class JarvisXL:
         if method in ("face", "both"):
             ok = self._face_id.register(name)
             msgs.append(f"face {'registered' if ok else 'failed'}")
-        if method in ("voice", "both") and self._last_voice_buf is not None:
-            ok = self._voice_id.register(name, self._last_voice_buf)
-            msgs.append(f"voice {'registered' if ok else 'needs more audio'}")
+        if method in ("voice", "both"):
+            ok = False
+            if self._last_voice_buf is not None:
+                ok = self._voice_id.register(name, self._last_voice_buf)
+            if not ok:
+                self.ui.write_log(f"REC: Recording voice samples for '{name}'...")
+                ok = self._voice_id.record_and_register(
+                    name, reps=2, duration_sec=3.5, prompt_cb=self.ui.write_log
+                )
+            msgs.append(f"voice {'registered' if ok else 'failed'}")
         if msgs:
             self._current_user = name
             update_memory({"identity": {"name": {"value": name}}})
@@ -819,76 +860,55 @@ class JarvisXL:
         if len(self._conversation) > self.MAX_HISTORY:
             self._conversation = self._auto_summarise(self._conversation)
 
-        messages = [
-            {"role": "system", "content": self._build_system_prompt()}
-        ] + list(self._conversation)
+        # ── 1. Fast Path: Pure Conversational Turns (tools=[]) ────────────────
+        if is_pure_conversational(user_text):
+            messages = [
+                {"role": "system", "content": self._build_system_prompt()}
+            ] + list(self._conversation)
 
-        _NEEDS_LLM_ROUND = {"web_search", "screen_process", "agent_task"}
-
-        for _round in range(self.MAX_TOOL_ROUNDS):
-            final_content    = ""
-            final_tool_calls: list = []
-            _streamed: list[str]   = []
+            final_content = ""
+            _streamed: list[str] = []
 
             try:
-                for event in call_llm_stream(messages, OLLAMA_TOOLS, purpose="conversation turn"):
+                for event in call_llm_stream(messages, tools=[], purpose="conversational turn"):
                     if event["type"] == "sentence":
                         _streamed.append(event["text"])
                         self.speak(event["text"])
                     elif event["type"] == "done":
-                        final_content    = event["content"]
-                        final_tool_calls = event["tool_calls"]
+                        final_content = event["content"]
             except RuntimeError as e:
                 self.speak_error("LLM", e)
                 return
 
-            if not final_tool_calls:
-                assistant_msg = {"role": "assistant", "content": final_content}
-                messages.append(assistant_msg)
-                self._conversation.append(assistant_msg)
-                self.ui.write_log(f"Jarvis: {final_content}")
-                if not _streamed and final_content:
-                    self.speak(final_content)
-                break
-
-            # Tool execution
-            assistant_msg = {
-                "role":       "assistant",
-                "content":    final_content,
-                "tool_calls": final_tool_calls,
-            }
-            messages.append(assistant_msg)
+            assistant_msg = {"role": "assistant", "content": final_content}
             self._conversation.append(assistant_msg)
+            self.ui.write_log(f"Jarvis: {final_content}")
+            if not _streamed and final_content:
+                self.speak(final_content)
+            if not self.ui.muted:
+                self.ui.set_state("LISTENING")
+            return
 
-            tool_results = []
-            for tc in final_tool_calls:
-                fn_name = tc.get("function", {}).get("name", "")
-                fn_args = tc.get("function", {}).get("arguments", {})
-                if isinstance(fn_args, str):
-                    try:
-                        fn_args = json.loads(fn_args)
-                    except Exception:
-                        fn_args = {}
+        # ── 2. Unified Action Pipeline: AgentExecutor / Planner ───────────────
+        try:
+            from agent.executor import AgentExecutor
+            executor = AgentExecutor()
+            result = executor.execute(
+                goal=user_text,
+                speak=self.speak,
+                player=self.ui,
+                submitted_interactively=True,
+                caller_class="desktop",
+            )
+            assistant_msg = {"role": "assistant", "content": result}
+            self._conversation.append(assistant_msg)
+            self.ui.write_log(f"Jarvis: {result}")
+        except Exception as e:
+            _log.error("AgentExecutor interactive execution failed: %s", e, exc_info=True)
+            self.speak_error("Executor", e)
 
-                result = self._execute_tool(fn_name, fn_args)
-                if result == "__SILENT__":
-                    continue
-
-                tool_results.append({
-                    "role":         "tool",
-                    "tool_call_id": tc.get("id", fn_name),
-                    "content":      str(result),
-                })
-
-                # Speak non-LLM tool results directly
-                if fn_name not in _NEEDS_LLM_ROUND and result not in ("Done.", ""):
-                    self.speak(result)
-
-            if tool_results:
-                messages.extend(tool_results)
-                self._conversation.extend(tool_results)
-            else:
-                break  # all silent tools, no second LLM pass needed
+        if not self.ui.muted:
+            self.ui.set_state("LISTENING")
 
     def _auto_summarise(self, conv: list) -> list:
         """Keep the last 10 turns; prepend a brief summary of older ones."""
@@ -1057,6 +1077,9 @@ class JarvisXL:
                 if not text.strip():
                     continue
 
+                if not self._is_ready.is_set():
+                    self._is_ready.wait()
+
                 normalized = text.strip().lower()
                 now        = time.time()
 
@@ -1199,6 +1222,8 @@ class JarvisXL:
                     self._tts_ready.set()
 
             self.ui.write_log("SYS: Loading systems in parallel…")
+            threading.Thread(target=self._tts_worker,       daemon=True).start()
+            threading.Thread(target=self._text_command_loop, daemon=True).start()
             threading.Thread(target=_do_warmup, daemon=True).start()
             threading.Thread(target=_do_stt,    daemon=True).start()
             threading.Thread(target=_do_tts,    daemon=True).start()
@@ -1207,11 +1232,10 @@ class JarvisXL:
             _warmup_done.wait(timeout=60)
             _stt_done.wait(timeout=60)
 
+            self._is_ready.set()
             self.ui.write_log("SYS: JARVIS-XL online.")
             self.ui.set_state("LISTENING")
 
-            threading.Thread(target=self._tts_worker,       daemon=True).start()
-            threading.Thread(target=self._text_command_loop, daemon=True).start()
             threading.Thread(target=self._proactive.run,     daemon=True).start()
 
             if stt_engine == "deepgram":

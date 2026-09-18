@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import time
 import subprocess
@@ -397,6 +398,27 @@ def _launch_linux(app_name: str) -> bool:
     return False
 
 
+def _extract_app_name_from_text(text: str) -> str:
+    """
+    Extract an application name from natural language query/description.
+    e.g. 'Open up WhatsApp', 'launch Google Chrome', 'pull up Spotify', 'start notepad'.
+    """
+    if not text or not isinstance(text, str):
+        return ""
+    cleaned = text.strip()
+    patterns = [
+        r"^(?:please\s+)?(?:open\s+up|open|launch|start|run|pull\s+up|bring\s+up)\s+(?:the\s+)?([A-Za-z0-9\s\-._+]+?)(?:\s+(?:app|application|program|window|browser|please|now)|[?.!,;]|$)",
+        r"\b(?:open\s+up|open|launch|start|run|pull\s+up|bring\s+up)\s+(?:the\s+)?([A-Za-z0-9\s\-._+]+?)(?:\s+(?:app|application|program|window|browser|please|now)|[?.!,;]|$)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, cleaned, re.IGNORECASE)
+        if m:
+            cand = m.group(1).strip()
+            if cand.lower() not in ("it", "this", "that", "something", "anything", "app", "application", "program"):
+                return cand
+    return cleaned
+
+
 _OS_LAUNCHERS = {
     "Windows": _launch_windows,
     "Darwin":  _launch_macos,
@@ -409,7 +431,17 @@ def open_app(
     player=None,
     session_memory=None,
 ) -> str:
-    app_name = (parameters or {}).get("app_name", "").strip()
+    params = parameters or {}
+    app_name = params.get("app_name", "").strip()
+
+    if not app_name:
+        for field in ("query", "description", "goal", "prompt", "text", "name"):
+            val = params.get(field)
+            if val and isinstance(val, str):
+                extracted = _extract_app_name_from_text(val) or val.strip()
+                if extracted:
+                    app_name = extracted
+                    break
 
     if not app_name:
         return "No application name provided."

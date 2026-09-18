@@ -117,11 +117,12 @@ TOOL_CONTRACTS: dict[str, ToolContract] = {
     "desktop_control":   _contract("desktop_control",   timeout_seconds=150, retryable=False, risk_level="high"),
     "vision_fix_code":   _contract("vision_fix_code",   timeout_seconds=150, retryable=False, risk_level="high"),
 
-    # code_helper/dev_agent: timeout sized to their worst action (code_helper's
+    # code_helper/dev_agent/coding_agent: timeout sized to their worst action (code_helper's
     # multi-attempt "build" loop; dev_agent's multi-file generation + install
-    # + up to 5 fix attempts), not their typical one — see module docstring.
-    "code_helper": _contract("code_helper", timeout_seconds=600, retryable=False, risk_level="high"),
-    "dev_agent":   _contract("dev_agent",   timeout_seconds=900, retryable=False, risk_level="high"),
+    # + up to 5 fix attempts; coding_agent's autonomous agy build loop), not their typical one.
+    "code_helper":   _contract("code_helper",   timeout_seconds=600, retryable=False, risk_level="high"),
+    "dev_agent":     _contract("dev_agent",     timeout_seconds=900, retryable=False, risk_level="high"),
+    "coding_agent":  _contract("coding_agent",  timeout_seconds=900, retryable=False, risk_level="high"),
 
     # reminder: writes a notify script to disk + registers a real OS-level
     # scheduled task/cron/launchd job — same risk class as file_controller's

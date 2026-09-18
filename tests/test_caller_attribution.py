@@ -161,7 +161,7 @@ class ExecutorAttributionIntegrationTest(unittest.TestCase):
         executor.create_plan   = lambda goal, task_id=None: {"steps": [
             {"step": 1, "tool": "weather_report", "description": "check weather", "parameters": {}},
         ]}
-        executor.dispatch_tool = lambda tool, args, player, speak, task_id=None, submitted_interactively=True: "Sunny."
+        executor.dispatch_tool = lambda tool, args, player, speak, task_id=None, submitted_interactively=True, **kwargs: "Sunny."
 
         ex = executor.AgentExecutor()
         ex.execute(goal="check weather", task_id="t-desktop", submitted_interactively=False)
@@ -216,7 +216,7 @@ class ExecutorAttributionIntegrationTest(unittest.TestCase):
         executor.create_plan   = lambda goal, task_id=None: {"steps": [
             {"step": 1, "tool": "code_helper", "description": "fix bug", "parameters": {}},
         ]}
-        executor.dispatch_tool = lambda tool, args, player, speak, task_id=None, submitted_interactively=True: "Fixed."
+        executor.dispatch_tool = lambda tool, args, player, speak, task_id=None, submitted_interactively=True, **kwargs: "Fixed."
 
         ex = executor.AgentExecutor()
         ex.execute(
@@ -242,7 +242,7 @@ class ExecutorAttributionIntegrationTest(unittest.TestCase):
         executor.create_plan = lambda goal, task_id=None: {"steps": [
             {"step": 1, "tool": "weather_report", "description": "x", "parameters": {}},
         ]}
-        executor.dispatch_tool = lambda tool, args, player, speak, task_id=None, submitted_interactively=True: "Rejected — bad input."
+        executor.dispatch_tool = lambda tool, args, player, speak, task_id=None, submitted_interactively=True, **kwargs: "Rejected — bad input."
         executor.replan = lambda goal, completed_steps, failed_step, failed_error, task_id=None: {"steps": []}
 
         ex = executor.AgentExecutor()
@@ -278,7 +278,7 @@ class TaskQueueCallerClassWiringTest(unittest.TestCase):
         executor.create_plan   = lambda goal, task_id=None: {"steps": [
             {"step": 1, "tool": "weather_report", "description": "x", "parameters": {}},
         ]}
-        executor.dispatch_tool = lambda tool, args, player, speak, task_id=None, submitted_interactively=True: "Sunny."
+        executor.dispatch_tool = lambda tool, args, player, speak, task_id=None, submitted_interactively=True, **kwargs: "Sunny."
 
         q = task_queue.TaskQueue()
         q.start()
@@ -309,7 +309,7 @@ class TaskQueueCallerClassWiringTest(unittest.TestCase):
         executor.create_plan   = lambda goal, task_id=None: {"steps": [
             {"step": 1, "tool": "weather_report", "description": "x", "parameters": {}},
         ]}
-        executor.dispatch_tool = lambda tool, args, player, speak, task_id=None, submitted_interactively=True: "Sunny."
+        executor.dispatch_tool = lambda tool, args, player, speak, task_id=None, submitted_interactively=True, **kwargs: "Sunny."
 
         q = task_queue.TaskQueue()
         q.start()

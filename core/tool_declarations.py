@@ -85,13 +85,18 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "weather_report",
-        "description": "Gets weather for any city. If city is omitted, defaults to saved city in memory or asks user.",
+        "description": (
+            "Gets the current weather report and forecast for any city or region. "
+            "ALWAYS pass the 'city' parameter if a city is named in the user request "
+            "(e.g. 'weather in Tokyo' -> city='Tokyo'). "
+            "Omit 'city' only if the user did not specify any location."
+        ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
                 "city": {
                     "type": "STRING",
-                    "description": "Optional. City for the weather report. If omitted, defaults to saved city in memory."
+                    "description": "The city or region to get weather for (e.g. 'Tokyo', 'Paris', 'New York'). Omit only if no city was specified."
                 }
             },
             "required": []
@@ -250,6 +255,22 @@ TOOL_DECLARATIONS = [
                 "description":  {"type": "STRING"},
                 "language":     {"type": "STRING"},
                 "project_name": {"type": "STRING"},
+            },
+            "required": ["description"]
+        }
+    },
+    {
+        "name": "coding_agent",
+        "description": (
+            "Specialized engineering and coding sub-agent powered by Google Antigravity. "
+            "Builds, edits, refactors, debugs, and tests complete projects, codebases, and scripts."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "description":  {"type": "STRING", "description": "Specification of the coding task or project to build"},
+                "language":     {"type": "STRING", "description": "Target programming language (default: python)"},
+                "project_name": {"type": "STRING", "description": "Optional name for the project directory"},
             },
             "required": ["description"]
         }
@@ -417,11 +438,11 @@ TOOL_DECLARATIONS = [
     {
         "name": "daily_briefing",
         "description": (
-            "Give the user a spoken morning/afternoon/evening briefing: "
-            "greeting, today's date, current weather in their city, "
-            "today's pending reminders, and top news headlines. Use when "
-            "the user asks for a briefing, summary of their day, or says "
-            "something like 'what's my day look like' or 'give me a briefing'."
+            "Gives a spoken comprehensive daily briefing combining: morning/evening greeting, "
+            "today's date, current weather, pending reminders/schedule, and top news headlines. "
+            "ONLY call when the user explicitly asks for a full daily briefing or overview of their day "
+            "(e.g. 'give me my briefing', 'morning briefing', 'what's my day look like'). "
+            "Do NOT call for standalone weather questions — use weather_report instead."
         ),
         "parameters": {
             "type": "OBJECT",

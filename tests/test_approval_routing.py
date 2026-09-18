@@ -76,6 +76,16 @@ from tests.test_hermes_api import HermesApiTestCase, _use_temp_db  # noqa: E402
 
 
 class ApprovalRoutingTest(HermesApiTestCase):
+    def setUp(self):
+        super().setUp()
+        from unittest.mock import patch
+        self._llm_patch = patch("core.llm_client.call_llm_text", return_value="Step completed.")
+        self._llm_patch.start()
+
+    def tearDown(self):
+        self._llm_patch.stop()
+        super().tearDown()
+
     def _submit_ask_and_wait_step(self, caller_class: str, tool: str, parameters: dict, goal: str = "do a gated thing"):
         """Submits a task whose single step is `tool` (must resolve to
         ask-and-wait for `caller_class`) directly through the real
@@ -110,30 +120,17 @@ class ApprovalRoutingTest(HermesApiTestCase):
         return None
 
     def test_service_bugfix_ask_and_wait_step_reaches_the_real_approval_channel(self):
-        """The core routing claim: a service:bugfix step that lands on
-        ask-and-wait surfaces through the exact same TASK_APPROVAL
-        channel a desktop-submitted task would — not a separate,
-        caller-class-forked mechanism."""
         orig_tool = tdisp.TOOL_DISPATCH.get("code_helper")
-        # code_helper is allow-listed (ask-and-wait) for service:bugfix —
-        # stubbed so this test is never accidentally satisfied by the
-        # real tool actually running before/without approval.
         tdisp.TOOL_DISPATCH["code_helper"] = lambda args, player, speak: "SHOULD NEVER RUN WITHOUT APPROVAL"
 
-        task_id  = self._submit_ask_and_wait_step(
-            policy.SERVICE_BUGFIX, "code_helper", {"action": "run", "file_path": "x.py"},
-        )
-        approval = self._find_pending_approval(task_id)
-
         try:
+            task_id  = self._submit_ask_and_wait_step(
+                policy.SERVICE_BUGFIX, "code_helper", {"action": "run", "file_path": "x.py"},
+            )
+            approval = self._find_pending_approval(task_id)
+
             self.assertIsNotNone(approval, "step never reached the real ask-and-wait approval channel")
 
-            # Expected per the plan: "task_events.triggered_by correctly
-            # recording service:bugfix" — checked here, BEFORE resolving
-            # the approval, against the step's own 'started' row (logged
-            # before dispatch_tool's ask-and-wait branch ever blocks) —
-            # this is the routing claim itself, not just the eventual
-            # outcome.
             started_row = db.get_conn().execute(
                 "SELECT triggered_by, caller_class FROM task_events "
                 "WHERE task_id = ? AND status = 'started'",
@@ -143,79 +140,45 @@ class ApprovalRoutingTest(HermesApiTestCase):
             self.assertEqual(started_row["triggered_by"], policy.SERVICE_BUGFIX)
             self.assertEqual(started_row["caller_class"], policy.SERVICE_BUGFIX)
 
-            self.assertEqual(tdisp.TOOL_DISPATCH["code_helper"](None, None, None), "SHOULD NEVER RUN WITHOUT APPROVAL")
-        finally:
-            # Drive it to resolution regardless of whether the assertions
-            # above passed — an unresolved approval leaves the real
-            # background worker thread blocked on the real 30-minute
-            # default timeout (see module docstring).
             if approval is not None:
                 ta_mod.TASK_APPROVAL.answer(approval["approval_id"], approve=True)
+
+            status = self._wait_for_task(task_id, timeout=5.0)
+            self.assertEqual(status["status"], "completed", status)
+
+            done_row = db.get_conn().execute(
+                "SELECT triggered_by FROM task_events WHERE task_id = ? AND status = 'done'",
+                (task_id,),
+            ).fetchone()
+            self.assertIsNotNone(done_row)
+            self.assertEqual(done_row["triggered_by"], policy.SERVICE_BUGFIX)
+        finally:
             if orig_tool is not None:
                 tdisp.TOOL_DISPATCH["code_helper"] = orig_tool
 
-        status = self._wait_for_task(task_id, timeout=5.0)
-        self.assertEqual(status["status"], "completed", status)
-
-        done_row = db.get_conn().execute(
-            "SELECT triggered_by FROM task_events WHERE task_id = ? AND status = 'done'",
-            (task_id,),
-        ).fetchone()
-        self.assertIsNotNone(done_row)
-        self.assertEqual(done_row["triggered_by"], policy.SERVICE_BUGFIX)
-
     def test_desktop_ask_and_wait_step_reaches_the_same_channel(self):
-        """Contrast case: desktop's own ask-and-wait routing is
-        unchanged, through the identical channel — proves this isn't a
-        new, service:*-only path bolted on beside the real one."""
         orig_tool = tdisp.TOOL_DISPATCH.get("code_helper")
         tdisp.TOOL_DISPATCH["code_helper"] = lambda args, player, speak: "ran"
 
-        task_id  = self._submit_ask_and_wait_step(policy.DESKTOP, "code_helper", {"action": "run", "file_path": "x.py"})
-        approval = self._find_pending_approval(task_id)
         try:
+            task_id  = self._submit_ask_and_wait_step(policy.DESKTOP, "code_helper", {"action": "run", "file_path": "x.py"})
+            approval = self._find_pending_approval(task_id)
             self.assertIsNotNone(approval, "desktop's own ask-and-wait step never reached the real approval channel")
             started_row = db.get_conn().execute(
                 "SELECT triggered_by FROM task_events WHERE task_id = ? AND status = 'started'", (task_id,),
             ).fetchone()
             self.assertEqual(started_row["triggered_by"], policy.DESKTOP)
-        finally:
+
             if approval is not None:
                 ta_mod.TASK_APPROVAL.answer(approval["approval_id"], approve=True)
+
+            status = self._wait_for_task(task_id, timeout=5.0)
+            self.assertEqual(status["status"], "completed", status)
+        finally:
             if orig_tool is not None:
                 tdisp.TOOL_DISPATCH["code_helper"] = orig_tool
 
-        status = self._wait_for_task(task_id, timeout=5.0)
-        self.assertEqual(status["status"], "completed", status)
-
     def test_denial_is_routed_and_recorded_the_same_way(self):
-        """The approval channel resolving to 'denied' is just as much a
-        real resolution as 'approved' — same routing claim, opposite
-        answer, still must not hang the worker thread.
-
-        A denial does NOT immediately fail the task — _short_circuit_reason
-        classifies it 'approval_denied', which (correctly, same as any
-        other step failure) falls through to AgentExecutor's real
-        replan() cascade before the task actually gives up (see D.22's
-        adversarial-gate test earlier in this phase for the same
-        replan-after-denial shape). replan() is stubbed here to end the
-        task immediately rather than let it make a real, slow LLM call —
-        found the hard way, the same class of leftover-background-work
-        risk as the weather_report/create_plan lessons elsewhere in this
-        phase.
-
-        Second finding, real and now fixed (Step 1.6c): AgentExecutor.
-        execute() never raises for "ran out of replan attempts" / "no
-        valid plan" — it returns a plain string either way — so
-        agent/task_queue.py's TaskQueue used to mark the overall Task
-        'completed' regardless of whether the goal was actually achieved
-        (only an uncaught exception used to produce 'failed' at the Task
-        level). Fixed by checking the real, durable outcome
-        (core.db.get_step_outcomes(), the same helper _summarize()
-        itself trusts) after execute() returns, rather than trusting a
-        lack of exception as success — see
-        agent/task_queue.py's _last_terminal_failure_detail(). This test
-        now asserts the fixed behavior directly."""
         orig_tool   = tdisp.TOOL_DISPATCH.get("code_helper")
         orig_replan = executor.replan
         tdisp.TOOL_DISPATCH["code_helper"] = lambda args, player, speak: "SHOULD NEVER RUN — DENIED"
@@ -224,143 +187,108 @@ class ApprovalRoutingTest(HermesApiTestCase):
         try:
             task_id  = self._submit_ask_and_wait_step(policy.SERVICE_BUGFIX, "code_helper", {"action": "run", "file_path": "x.py"})
             approval = self._find_pending_approval(task_id)
-            try:
-                self.assertIsNotNone(approval)
-            finally:
-                if approval is not None:
-                    ta_mod.TASK_APPROVAL.answer(approval["approval_id"], approve=False)
+            self.assertIsNotNone(approval)
+            if approval is not None:
+                ta_mod.TASK_APPROVAL.answer(approval["approval_id"], approve=False)
 
-            # Expected (Step 1.6c): Task.status must reflect the real
-            # denial, not silently read as 'completed'.
             status = self._wait_for_task(task_id, timeout=5.0)
             self.assertEqual(status["status"], "failed", status)
             self.assertIn("approval_denied", status["error"])
+
+            step_row = db.get_conn().execute(
+                "SELECT status, detail, triggered_by FROM task_events "
+                "WHERE task_id = ? AND tool = 'code_helper' AND status = 'failed' "
+                "ORDER BY event_id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            self.assertIsNotNone(step_row)
+            self.assertEqual(step_row["status"], "failed")
+            self.assertIn("approval_denied", step_row["detail"])
+            self.assertEqual(step_row["triggered_by"], policy.SERVICE_BUGFIX)
         finally:
             if orig_tool is not None:
                 tdisp.TOOL_DISPATCH["code_helper"] = orig_tool
             executor.replan = orig_replan
 
-        # The real outcome: the step itself is recorded as failed, with
-        # the specific approval_denied reason, correctly attributed.
-        step_row = db.get_conn().execute(
-            "SELECT status, detail, triggered_by FROM task_events "
-            "WHERE task_id = ? AND tool = 'code_helper' AND status = 'failed' "
-            "ORDER BY event_id DESC LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        self.assertIsNotNone(step_row)
-        self.assertEqual(step_row["status"], "failed")
-        self.assertIn("approval_denied", step_row["detail"])
-        self.assertEqual(step_row["triggered_by"], policy.SERVICE_BUGFIX)
-
     def test_approvals_rest_endpoint_can_resolve_a_service_bugfix_routed_approval(self):
-        """The same routing claim exercised through the real REST
-        endpoint (POST /approvals/{id}) rather than calling
-        TASK_APPROVAL.answer() directly — the full boundary, not just
-        the underlying primitive."""
         orig_tool = tdisp.TOOL_DISPATCH.get("code_helper")
         tdisp.TOOL_DISPATCH["code_helper"] = lambda args, player, speak: "ran"
 
-        task_id  = self._submit_ask_and_wait_step(policy.SERVICE_BUGFIX, "code_helper", {"action": "run", "file_path": "x.py"})
-        approval = self._find_pending_approval(task_id)
-        desktop_token = hermes_auth_mint(policy.DESKTOP)
         try:
+            task_id  = self._submit_ask_and_wait_step(policy.SERVICE_BUGFIX, "code_helper", {"action": "run", "file_path": "x.py"})
+            approval = self._find_pending_approval(task_id)
+            desktop_token = hermes_auth_mint(policy.DESKTOP)
             self.assertIsNotNone(approval)
             r = self.client.post(
                 f"/approvals/{approval['approval_id']}", json={"approve": True},
                 headers={"Authorization": f"Bearer {desktop_token}"},
             )
             self.assertEqual(r.status_code, 200, r.text)
-            approval = None  # resolved via the REST call above — finally must not double-answer
+
+            status = self._wait_for_task(task_id, timeout=5.0)
+            self.assertEqual(status["status"], "completed", status)
         finally:
-            if approval is not None:
-                ta_mod.TASK_APPROVAL.answer(approval["approval_id"], approve=True)
             if orig_tool is not None:
                 tdisp.TOOL_DISPATCH["code_helper"] = orig_tool
 
-        status = self._wait_for_task(task_id, timeout=5.0)
-        self.assertEqual(status["status"], "completed", status)
-
 
 class ApprovalResolutionAuthTest(ApprovalRoutingTest):
-    """Step 1.6b: an approval can only be resolved by the desktop
-    caller_class, regardless of which caller_class triggered the
-    underlying task. Subclasses ApprovalRoutingTest to reuse its
-    _submit_ask_and_wait_step()/_find_pending_approval() helpers rather
-    than reinventing them."""
-
     def test_service_support_cannot_resolve_a_service_bugfix_triggered_approval(self):
         orig_tool = tdisp.TOOL_DISPATCH.get("code_helper")
         tdisp.TOOL_DISPATCH["code_helper"] = lambda args, player, speak: "SHOULD NEVER RUN — WRONG CALLER RESOLVED IT"
 
-        task_id  = self._submit_ask_and_wait_step(policy.SERVICE_BUGFIX, "code_helper", {"action": "run", "file_path": "x.py"})
-        approval = self._find_pending_approval(task_id)
-        support_token = hermes_auth_mint(policy.SERVICE_SUPPORT)
         try:
+            task_id  = self._submit_ask_and_wait_step(policy.SERVICE_BUGFIX, "code_helper", {"action": "run", "file_path": "x.py"})
+            approval = self._find_pending_approval(task_id)
+            support_token = hermes_auth_mint(policy.SERVICE_SUPPORT)
             self.assertIsNotNone(approval)
 
             r = self.client.post(
                 f"/approvals/{approval['approval_id']}", json={"approve": True},
                 headers={"Authorization": f"Bearer {support_token}"},
             )
-            # Expected: rejected — service:support is not the desktop
-            # caller, even though it authenticated correctly and even
-            # though it isn't the caller_class that triggered this task
-            # either way (neither fact should matter — only 'desktop' can
-            # ever resolve an approval).
             self.assertEqual(r.status_code, 403, r.text)
 
-            # And the approval must still genuinely be pending — the
-            # rejected request must not have silently resolved it anyway.
             still_pending = any(
                 p["approval_id"] == approval["approval_id"] for p in ta_mod.TASK_APPROVAL.list_pending()
             )
             self.assertTrue(still_pending, "approval was resolved despite the 403")
+
+            ta_mod.TASK_APPROVAL.answer(approval["approval_id"], approve=True)
+            status = self._wait_for_task(task_id, timeout=5.0)
+            self.assertEqual(status["status"], "completed", status)
         finally:
-            if approval is not None:
-                ta_mod.TASK_APPROVAL.answer(approval["approval_id"], approve=True)
             if orig_tool is not None:
                 tdisp.TOOL_DISPATCH["code_helper"] = orig_tool
 
-        # Cleaned up via the real desktop-equivalent primitive above —
-        # the task itself still completes normally once actually resolved.
-        status = self._wait_for_task(task_id, timeout=5.0)
-        self.assertEqual(status["status"], "completed", status)
-
     def test_desktop_can_still_resolve_any_approval_regardless_of_triggering_caller(self):
-        """Contrast case: the fix must not accidentally scope resolution
-        to 'only the same caller_class that submitted the task' — the
-        plan is explicit that desktop resolves everything, unconditionally."""
         orig_tool = tdisp.TOOL_DISPATCH.get("code_helper")
         tdisp.TOOL_DISPATCH["code_helper"] = lambda args, player, speak: "ran"
 
-        task_id  = self._submit_ask_and_wait_step(policy.SERVICE_BUGFIX, "code_helper", {"action": "run", "file_path": "x.py"})
-        approval = self._find_pending_approval(task_id)
-        desktop_token = hermes_auth_mint(policy.DESKTOP)
         try:
+            task_id  = self._submit_ask_and_wait_step(policy.SERVICE_BUGFIX, "code_helper", {"action": "run", "file_path": "x.py"})
+            approval = self._find_pending_approval(task_id)
+            desktop_token = hermes_auth_mint(policy.DESKTOP)
             self.assertIsNotNone(approval)
             r = self.client.post(
                 f"/approvals/{approval['approval_id']}", json={"approve": True},
                 headers={"Authorization": f"Bearer {desktop_token}"},
             )
             self.assertEqual(r.status_code, 200, r.text)
-            approval = None
+
+            status = self._wait_for_task(task_id, timeout=5.0)
+            self.assertEqual(status["status"], "completed", status)
         finally:
-            if approval is not None:
-                ta_mod.TASK_APPROVAL.answer(approval["approval_id"], approve=True)
             if orig_tool is not None:
                 tdisp.TOOL_DISPATCH["code_helper"] = orig_tool
-
-        status = self._wait_for_task(task_id, timeout=5.0)
-        self.assertEqual(status["status"], "completed", status)
 
     def test_every_non_desktop_caller_class_is_rejected(self):
         orig_tool = tdisp.TOOL_DISPATCH.get("code_helper")
         tdisp.TOOL_DISPATCH["code_helper"] = lambda args, player, speak: "SHOULD NEVER RUN"
 
-        task_id  = self._submit_ask_and_wait_step(policy.SERVICE_BUGFIX, "code_helper", {"action": "run", "file_path": "x.py"})
-        approval = self._find_pending_approval(task_id)
         try:
+            task_id  = self._submit_ask_and_wait_step(policy.SERVICE_BUGFIX, "code_helper", {"action": "run", "file_path": "x.py"})
+            approval = self._find_pending_approval(task_id)
             self.assertIsNotNone(approval)
             for caller_class in policy.SERVICE_CALLER_CLASSES:
                 token = hermes_auth_mint(caller_class)
@@ -369,23 +297,15 @@ class ApprovalResolutionAuthTest(ApprovalRoutingTest):
                     headers={"Authorization": f"Bearer {token}"},
                 )
                 self.assertEqual(r.status_code, 403, f"{caller_class} was allowed to resolve an approval: {r.text}")
+
+            ta_mod.TASK_APPROVAL.answer(approval["approval_id"], approve=True)
+            status = self._wait_for_task(task_id, timeout=5.0)
+            self.assertEqual(status["status"], "completed", status)
         finally:
-            if approval is not None:
-                ta_mod.TASK_APPROVAL.answer(approval["approval_id"], approve=True)
             if orig_tool is not None:
                 tdisp.TOOL_DISPATCH["code_helper"] = orig_tool
 
-        status = self._wait_for_task(task_id, timeout=5.0)
-        self.assertEqual(status["status"], "completed", status)
-
     def test_no_route_reachable_without_auth_still_covers_the_new_router(self):
-        """Structural check mirroring
-        tests/test_hermes_api.py's AuthRejectionTest — the new
-        approval_resolution_router must still reject a completely
-        unauthenticated request (401), before ever reaching the
-        desktop-only check (403) — the two dependencies must be layered
-        in the right order, not the desktop check accidentally running
-        (and maybe passing/failing oddly) before auth itself."""
         import api.hermes_app as hermes_app
         r = self.client.post("/approvals/1", json={"approve": True})
         self.assertEqual(r.status_code, 401)

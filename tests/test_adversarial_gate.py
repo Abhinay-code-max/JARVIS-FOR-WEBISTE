@@ -342,7 +342,7 @@ class B8_WebSearchResultInjectionTest(unittest.TestCase):
     def test_B8_web_search_result_injection_treated_as_data_not_instruction(self):
         calls = []
 
-        def _fake_dispatch(tool, args, player, speak, task_id=None, submitted_interactively=True):
+        def _fake_dispatch(tool, args, player, speak, task_id=None, submitted_interactively=True, **kwargs):
             calls.append((tool, dict(args)))
             if tool == "web_search":
                 return _MALICIOUS_WEB_RESULT

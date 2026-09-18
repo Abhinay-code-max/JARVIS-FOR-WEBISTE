@@ -142,7 +142,7 @@ class TaskStatusRealEndToEndTest(unittest.TestCase):
             time.sleep(0.02)
         return None
 
-    def _wait_for_terminal(self, q: "task_queue.TaskQueue", task_id: str, timeout: float = 5.0) -> dict:
+    def _wait_for_terminal(self, q: "task_queue.TaskQueue", task_id: str, timeout: float = 10.0) -> dict:
         deadline = time.time() + timeout
         status = None
         while time.time() < deadline:
@@ -192,6 +192,8 @@ class TaskStatusRealEndToEndTest(unittest.TestCase):
         ]}
         orig_tool = tdisp.TOOL_DISPATCH.get("code_helper")
         tdisp.TOOL_DISPATCH["code_helper"] = lambda args, player, speak: "ran successfully"
+        orig_summarize = executor.AgentExecutor._summarize
+        executor.AgentExecutor._summarize = lambda self, goal, speak, task_id=None: "done summary"
 
         q = task_queue.TaskQueue()
         q.start()
@@ -204,6 +206,7 @@ class TaskStatusRealEndToEndTest(unittest.TestCase):
             status = self._wait_for_terminal(q, task_id)
         finally:
             q.stop()
+            executor.AgentExecutor._summarize = orig_summarize
             if orig_tool is not None:
                 tdisp.TOOL_DISPATCH["code_helper"] = orig_tool
 

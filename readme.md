@@ -68,8 +68,9 @@ Microphone → STT (Whisper / Vosk)
 #    Then pull a model:
 ollama pull qwen2.5:7b
 
-# 2. Clone / download the project and launch
-cd Mark-XL
+# 2. Clone / download the project and launch (Windows):
+start_jarvis.bat
+# Or:
 python main.py
 ```
 

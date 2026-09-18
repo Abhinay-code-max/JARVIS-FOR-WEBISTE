@@ -227,7 +227,7 @@ class ReplanDoesNotLeakStaleStepResultsTest(unittest.TestCase):
                  }, "critical": True},
             ]}
 
-        def _fake_dispatch(tool, args, player, speak, task_id=None, submitted_interactively=True):
+        def _fake_dispatch(tool, args, player, speak, task_id=None, submitted_interactively=True, **kwargs):
             self.calls.append((tool, dict(args)))
             if tool == "weather_report" and args.get("city") == "origin_probe":
                 return "OLD_VALUE"
@@ -301,7 +301,7 @@ class FlightsToContactExampleTest(unittest.TestCase):
                 },
             ]}
 
-        def _fake_dispatch(tool, args, player, speak, task_id=None, submitted_interactively=True):
+        def _fake_dispatch(tool, args, player, speak, task_id=None, submitted_interactively=True, **kwargs):
             self.calls.append((tool, dict(args)))
             if tool == "flight_finder":
                 return "The cheapest option is Delta at $350 USD, departing 10:00, non-stop."

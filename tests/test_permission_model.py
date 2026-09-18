@@ -223,7 +223,7 @@ class ExecutorStepFailsCleanlyOnTimeoutTest(unittest.TestCase):
             # on its next loop iteration instead of retrying the step again.
             return {"steps": []}
 
-        def _fake_dispatch(tool, args, player, speak, task_id=None, submitted_interactively=True):
+        def _fake_dispatch(tool, args, player, speak, task_id=None, submitted_interactively=True, **kwargs):
             return f"Cancelled — '{tool}' timed out waiting for approval."
 
         executor.create_plan   = _fake_plan

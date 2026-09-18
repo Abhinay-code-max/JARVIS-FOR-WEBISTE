@@ -31,26 +31,31 @@ _NO  = {"no", "n", "nope", "nah", "cancel", "stop", "don't", "dont", "abort"}
 
 class _ConfirmationGate:
     def __init__(self):
-        self._lock    = threading.Lock()
-        self._pending = False
-        self._event   = threading.Event()
-        self._answer  = False
+        self._lock        = threading.Lock()
+        self._pending     = False
+        self._event       = threading.Event()
+        self._answer      = False
+        self._text_answer = None
+        self._mode        = "boolean"
 
     def is_pending(self) -> bool:
         with self._lock:
             return self._pending
 
     def answer(self, text: str) -> bool:
-        """Called from the input chokepoint when a confirmation is pending.
+        """Called from the input chokepoint when a confirmation or clarification is pending.
         Runs on the audio/transcript producer thread — no DB or other I/O
-        here, ever. Returns True once consumed as an answer (yes -> proceed,
-        no/anything unclear -> treated as a decline, so an unrelated reply
-        can't leave the gate hanging)."""
-        normalized = text.strip().lower()
+        here, ever. Returns True once consumed as an answer."""
+        normalized = text.strip()
         with self._lock:
             if not self._pending:
                 return False
-            self._answer = normalized in _YES
+            if self._mode == "text":
+                self._text_answer = normalized
+                self._answer      = bool(normalized)
+            else:
+                self._answer      = normalized.lower() in _YES
+                self._text_answer = normalized
             self._pending = False
         self._event.set()
         return True
@@ -132,6 +137,43 @@ class _ConfirmationGate:
                 _log.warning("Approval denied: %s", prompt[:120])
             _finish("approved" if answer else "denied")
             return answer
+        finally:
+            with self._lock:
+                self._pending = False
+
+    def request_clarification(self, player, prompt: str, speak=None, timeout: float = 45.0) -> str | None:
+        """Blocking. Surfaces a clarifying question to the user and waits for a text answer.
+        Returns the user's response string, or None if no live player or timed out."""
+        if player is None:
+            self._log_result(prompt, time.time(), "no_player")
+            return None
+
+        requested_at = time.time()
+        with self._lock:
+            self._pending     = True
+            self._mode        = "text"
+            self._event.clear()
+            self._answer      = False
+            self._text_answer = None
+
+        try:
+            player.write_log(f"CLARIFY: {prompt}")
+            if speak:
+                speak(prompt)
+
+            got_answer = self._event.wait(timeout=timeout)
+            with self._lock:
+                text_ans, still_pending = self._text_answer, self._pending
+
+            if not got_answer or still_pending or not text_ans:
+                with self._lock:
+                    self._pending = False
+                player.write_log("CLARIFY: no response — proceeding with failure.")
+                _log.warning("Clarification timed out: %s", prompt[:120])
+                return None
+
+            player.write_log(f"CLARIFY: received '{text_ans}'.")
+            return text_ans
         finally:
             with self._lock:
                 self._pending = False

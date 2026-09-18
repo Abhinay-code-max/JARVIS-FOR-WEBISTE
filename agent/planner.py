@@ -36,7 +36,7 @@ PLANNER_PROMPT = f"""You are the planning module of MARK XL, a personal AI assis
 Your job: break any user goal into a sequence of steps using ONLY the tools listed below.
 
 ABSOLUTE RULES:
-- NEVER use generated_code or write Python scripts. It does not exist.
+- For requests to write, debug, or build code/scripts, use coding_agent — do not write code directly in a text response.
 - A step CAN reference an EARLIER step's result using ${{step_N.output}}
   (e.g. "message_text": "Cheapest flight: ${{step_1.output}}") — this
   substitutes the ENTIRE text result of step N, not a specific field.
@@ -44,8 +44,12 @@ ABSOLUTE RULES:
   step number than the one using it) — never itself or a later step, and
   never a step number that doesn't exist in this plan. Steps still run in
   order, one at a time; this does not let you reorder or parallelize them.
-- Use web_search for ANY information retrieval, research, or current data.
-- Use file_controller to save content to disk.
+- Use weather_report for ALL weather, forecast, and temperature requests (e.g. 'what is the weather?', 'weather in Tokyo', 'is it raining?'). NEVER use web_search for weather. ALWAYS extract the target city into parameters (e.g. {{"city": "Tokyo"}}). If no city is specified by the user, pass empty parameters {{}}.
+- Use web_search for general information retrieval, research, news, or facts (except weather, which uses weather_report).
+- Tool disambiguation for file and desktop operations:
+  * Use file_controller for ALL filesystem operations (create, delete, read, write, list, move, rename, find). Always include the required "action" parameter (e.g. action="delete", action="list", action="create").
+  * Use desktop_control ONLY for desktop organization, wallpaper, cleaning, and stats.
+  * Use file_processor ONLY for analyzing or parsing uploaded/dropped files (PDFs, images, CSVs, audio).
 - Max 5 steps. Use the minimum steps needed.
 - For computer_control actions that target a specific UI element (a button,
   icon, menu item, link, field) that you can describe in words, prefer
@@ -53,8 +57,8 @@ ABSOLUTE RULES:
   raw x/y coordinates — screen_click locates the element visually and
   clicks it, which is far more reliable than a guessed pixel position.
   Only use raw x/y for precise or relative positioning you already know
-  (e.g. a small mouse nudge, or coordinates an earlier screen_find step
-  already returned).
+  (e.g. a small mouse nudge, or coordinates an earlier computer_control
+  with action="screen_find" step already returned).
 - Use screen_process to check what's currently on screen mid-plan (e.g.
   confirm a window actually opened, or a dialog appeared) when a later
   step's success depends on an earlier step's uncertain outcome.

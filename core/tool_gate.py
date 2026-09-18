@@ -36,7 +36,7 @@ from core.tool_contracts   import get_contract, ToolContract
 from core.confirm          import CONFIRM
 from core.policy           import (
     get_policy_level, ACTION_EXTRACTORS, ASK_AND_WAIT, HARD_DENY, AUTO_ALLOW, NOTIFY_ONLY,
-    DESKTOP,
+    DESKTOP, KNOWN_TOOL_ACTIONS,
 )
 from core.task_approval    import TASK_APPROVAL
 from core.postconditions   import check_postcondition
@@ -234,15 +234,21 @@ _TYPE_CHECKERS = {
     "OBJECT":  lambda v: isinstance(v, dict),
 }
 
+# Canonical action validation tables — tools whose action set is defined
+# and bounded. Any unrecognized action is rejected immediately before policy
+# evaluation or dispatch.
+VALID_TOOL_ACTIONS: dict[str, set[str]] = KNOWN_TOOL_ACTIONS
+
 
 def validate_input(tool: str, args: dict, schema: dict) -> str | None:
     """Returns None if `args` satisfies `schema` (TOOL_DECLARATIONS'
     Gemini-style {type, properties, required} shape), else a short
     human-readable description of what's wrong — required-but-missing
-    field(s), or a field whose value the underlying tool would crash on
-    (see _TYPE_CHECKERS). Unknown/extra keys are tolerated, not rejected —
-    an LLM occasionally adding a harmless extra field isn't worth the
-    friction of rejecting the whole call over."""
+    field(s), an invalid/unrecognized action for action-based tools, or a
+    field whose value the underlying tool would crash on (see _TYPE_CHECKERS).
+    Unknown/extra keys are tolerated, not rejected — an LLM occasionally
+    adding a harmless extra field isn't worth the friction of rejecting the
+    whole call over."""
     if not isinstance(args, dict):
         return f"parameters must be an object, got {type(args).__name__}."
 
@@ -253,6 +259,17 @@ def validate_input(tool: str, args: dict, schema: dict) -> str | None:
     if missing:
         return f"missing required parameter(s): {', '.join(missing)}."
 
+    # Validate action parameter against canonical valid actions for bounded tools
+    if tool in VALID_TOOL_ACTIONS and "action" in args:
+        raw_action = args.get("action")
+        if raw_action is not None:
+            action_str = str(raw_action).lower().strip().replace(" ", "_").replace("-", "_")
+            if action_str not in VALID_TOOL_ACTIONS[tool]:
+                return (
+                    f"'{raw_action}' is not a valid action for '{tool}'. "
+                    f"Valid actions: {', '.join(sorted(VALID_TOOL_ACTIONS[tool]))}."
+                )
+
     for key, value in args.items():
         if key not in props or value is None:
             continue
@@ -262,6 +279,12 @@ def validate_input(tool: str, args: dict, schema: dict) -> str | None:
             return (
                 f"parameter '{key}' should be {expected_type.lower()}, "
                 f"got {type(value).__name__} ({value!r})."
+            )
+        enum_vals = props[key].get("enum")
+        if enum_vals and value not in enum_vals:
+            return (
+                f"parameter '{key}' must be one of {sorted(enum_vals)}, "
+                f"got {value!r}."
             )
 
     return None
@@ -374,12 +397,14 @@ def dispatch_tool(
 
     contract = get_contract(tool)
     action   = _extract_action(tool, args)
-    level    = get_policy_level(tool, action, caller_class)
 
+    # Validate input BEFORE policy lookup or dispatch
     validation_error = validate_input(tool, args, contract.input_schema)
     if validation_error:
-        _log_decision(tool, action, level, "rejected", task_id)
+        _log_decision(tool, action, "none", "rejected", task_id)
         return f"Rejected — '{tool}' parameters are invalid: {validation_error}"
+
+    level = get_policy_level(tool, action, caller_class)
 
     path_scope_error = _validate_service_path_scope(tool, args, caller_class)
     if path_scope_error:
@@ -419,6 +444,15 @@ def dispatch_tool(
         if player is not None:
             approved = CONFIRM.request(player, prompt, speak=speak)
             outcome  = "approved" if approved else "denied"
+            if approved:
+                # Dual-Factor Biometric Presence Gate: Require BOTH Face + Voice match for Abhinay
+                # Fail-closed: If either fails, mismatch, or missing, the action is blocked.
+                from core.presence import verify_biometric_presence
+                presence_ok, reason, _ = verify_biometric_presence(player=player, speak=speak)
+                if not presence_ok:
+                    should_invoke = False
+                    outcome       = "presence_denied"
+                    early_result  = f"Denied — biometric presence verification failed: {reason}."
         else:
             note = " (submitted interactively)" if submitted_interactively else " (system-submitted)"
             approved, outcome = TASK_APPROVAL.wait_for_approval(task_id, prompt + note)
@@ -431,7 +465,7 @@ def dispatch_tool(
             # caller) — keep these two phrasings and don't merge them.
             if outcome == "timeout":
                 early_result = f"Cancelled — '{tool}' timed out waiting for approval."
-            else:
+            elif outcome != "presence_denied":
                 early_result = f"Cancelled — '{tool}' was not approved."
 
     if should_invoke:

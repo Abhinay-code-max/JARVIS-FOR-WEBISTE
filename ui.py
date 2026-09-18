@@ -470,6 +470,8 @@ class HudCanvas(QWidget):
         elif self.state == "LISTENING":
             sym = "●" if self._blink else "○"
             txt, col = f"{sym}  LISTENING",  qcol(C.GREEN)
+        elif "LOCKED" in self.state:
+            txt, col = f"🔒  {self.state}",  qcol(C.ACC2)
         else:
             sym = "●" if self._blink else "○"
             txt, col = f"{sym}  {self.state}", qcol(C.PRI)
@@ -2048,6 +2050,10 @@ class JarvisUI:
     def muted(self, v: bool):
         if v != self._win._muted:
             self._win._toggle_mute()
+
+    @property
+    def state(self) -> str:
+        return self._win.hud.state if hasattr(self._win, "_apply_state") and hasattr(self._win, "hud") else ""
 
     @property
     def current_file(self) -> str | None:

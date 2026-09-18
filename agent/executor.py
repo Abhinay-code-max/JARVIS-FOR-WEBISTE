@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import os
 import time
+import uuid
 from pathlib import Path
 from typing import Callable
 
@@ -21,10 +22,34 @@ from core.llm_client        import call_llm_text
 from core.tool_dispatch     import TOOL_DISPATCH
 from core.tool_gate         import dispatch_tool
 from core.tool_contracts    import get_contract
-from core.db                import log_task_event, get_step_outcomes
+from core.confirm           import CONFIRM
+from core.db                import log_task_event, get_step_outcomes, get_conn
 from config                 import BASE_DIR
 
 _log = logging.getLogger("jarvis.executor")
+
+
+def _extract_missing_parameters(error_msg: str) -> str | None:
+    """Extracts missing parameter names if error_msg represents a validation_failed
+    caused specifically by missing required parameters, else None."""
+    if not isinstance(error_msg, str):
+        return None
+    if not (error_msg.startswith("validation_failed:") or error_msg.startswith("Rejected — ")):
+        return None
+    if "missing required parameter(s):" not in error_msg:
+        return None
+    m = re.search(r"missing required parameter\(s\):\s*([^.]+)", error_msg)
+    return m.group(1).strip() if m else None
+
+
+def _format_clarification_question(tool: str, missing_params: str, desc: str = "") -> str:
+    """Constructs a user-facing clarification question naming the tool and missing parameters."""
+    clean_desc = desc.strip().rstrip(".")
+    if tool == "file_controller" and "delete" in clean_desc.lower():
+        return "Which file should file_controller delete?"
+    if clean_desc:
+        return f"Which {missing_params} should {tool} use to {clean_desc}?"
+    return f"Which {missing_params} should {tool} use?"
 
 
 # ---------------------------------------------------------------------------
@@ -157,11 +182,80 @@ def _translate_to_goal_language(content: str, goal: str, task_id: str | None = N
 
 def _inject_context(
     params: dict, tool: str, step_results: dict, goal: str = "",
-    task_id: str | None = None, step_num=None,
+    task_id: str | None = None, step_num=None, desc: str = "",
 ) -> dict:
+    params = dict(params or {})
+
+    # 1. Tool-specific parameter extraction from desc / goal before validation
+    if tool == "open_app" and (not params.get("app_name") or not str(params.get("app_name")).strip()):
+        from actions.open_app import _extract_app_name_from_text
+        extracted = _extract_app_name_from_text(desc) or _extract_app_name_from_text(goal)
+        if extracted:
+            params["app_name"] = extracted
+            _log.debug("Injected extracted app_name '%s' into open_app params", extracted)
+
+    elif tool in ("coding_agent", "dev_agent") and (not params.get("description") or not str(params.get("description")).strip()):
+        extracted = (desc or goal).strip()
+        if extracted:
+            params["description"] = extracted
+            _log.debug("Injected description '%s' into %s params", extracted, tool)
+
+    elif tool == "code_helper":
+        if not params.get("description") or not str(params.get("description")).strip():
+            extracted = (desc or goal).strip()
+            if extracted:
+                params["description"] = extracted
+        if not params.get("action") or not str(params.get("action")).strip():
+            low = (desc + " " + goal).lower()
+            if "run" in low or "execute" in low:
+                params["action"] = "run"
+            elif "edit" in low or "modify" in low or "change" in low:
+                params["action"] = "edit"
+            elif "explain" in low or "understand" in low:
+                params["action"] = "explain"
+            elif "build" in low:
+                params["action"] = "build"
+            elif "optimize" in low:
+                params["action"] = "optimize"
+            else:
+                params["action"] = "write"
+            _log.debug("Injected action '%s' into code_helper params", params["action"])
+
+    elif tool == "weather_report" and (not params.get("city") or not str(params.get("city")).strip()):
+        from actions.weather_report import _extract_city_from_text
+        extracted = _extract_city_from_text(desc) or _extract_city_from_text(goal)
+        if extracted:
+            params["city"] = extracted
+            _log.debug("Injected extracted city '%s' into weather_report params", extracted)
+
+    elif tool == "web_search" and (not params.get("query") or not str(params.get("query")).strip()):
+        extracted = (desc or goal).strip()
+        if extracted:
+            params["query"] = extracted
+            _log.debug("Injected query '%s' into web_search params", extracted)
+
+    elif tool == "screen_process" and (not params.get("text") or not str(params.get("text")).strip()):
+        params["text"] = (desc or goal or "What is on the screen?").strip()
+
+    elif tool == "file_controller" and (not params.get("action") or not str(params.get("action")).strip()):
+        low = (desc + " " + goal).lower()
+        if any(w in low for w in ("folder", "directory")) and any(w in low for w in ("create", "make", "new", "write")):
+            params["action"] = "create_folder"
+        elif any(w in low for w in ("create", "make", "new", "write", "save")):
+            params["action"] = "create_file"
+        elif any(w in low for w in ("delete", "remove", "erase")):
+            params["action"] = "delete"
+        elif any(w in low for w in ("read", "view", "cat", "open", "show")):
+            params["action"] = "read"
+        elif any(w in low for w in ("list", "dir", "ls")):
+            params["action"] = "list"
+        else:
+            params["action"] = "list"
+        _log.debug("Injected action '%s' into file_controller params", params["action"])
+
+    # 2. File controller content injection from previous step results
     if not step_results:
         return params
-    params = dict(params)
     if tool == "file_controller" and params.get("action") in ("write", "create_file"):
         content = params.get("content", "")
         if not content or len(content) < 50:
@@ -211,7 +305,7 @@ def _approval_outcome(result) -> str | None:
         return None
     if "timed out waiting for approval" in result:
         return "timeout"
-    if "was not approved" in result:
+    if "was not approved" in result or "biometric presence verification failed" in result:
         return "denied"
     return None
 
@@ -305,6 +399,8 @@ def _call_tool(
     tool: str, parameters: dict, speak: Callable | None,
     task_id: str | None = None, step_num=None,
     submitted_interactively: bool = True,
+    caller_class: str = "desktop",
+    player = None,
 ) -> str:
     if tool == "generated_code":
         description = parameters.get("description", "")
@@ -313,14 +409,11 @@ def _call_tool(
         return _run_generated_code(description, speak=speak, task_id=task_id, step_num=step_num)
 
     elif tool in TOOL_DISPATCH:
-        # player=None: this executor runs without a live UI/session — the
-        # shared wrappers in core/tool_dispatch.py already handle that
-        # (e.g. file_processor's current_file lookup no-ops when player
-        # has no such attribute). Policy evaluation + gating happens in
-        # dispatch_tool(), not here — see core/tool_gate.py.
+        # Policy evaluation + gating happens in dispatch_tool() — see core/tool_gate.py.
         return dispatch_tool(
-            tool, parameters, None, speak,
+            tool, parameters, player, speak,
             task_id=task_id, submitted_interactively=submitted_interactively,
+            caller_class=caller_class,
         )
 
     else:
@@ -339,24 +432,36 @@ def _describe_outcome(o: dict) -> str:
     Shared by both the deterministic fallback and the LLM prompt's
     structured input, so the two can't describe the same step
     differently."""
-    desc = o["description"] or o["tool"] or f"step {o['step_num']}"
-    if o["status"] == "done":
-        if o["detail"].startswith("recovered via fix"):
+    desc = o.get("description") or o.get("tool") or f"step {o.get('step_num', '?')}"
+    detail = (o.get("detail") or "").strip()
+    if o.get("status") == "done":
+        if detail.startswith("recovered via fix"):
             return f"{desc} (accomplished via an alternative approach after the first attempt failed)"
+        if detail and detail != desc:
+            return f"{desc}: {detail}"
         return desc
-    if o["status"] == "skipped":
-        return f"{desc} — SKIPPED ({o['detail'] or 'no reason recorded'})"
-    if o["status"] == "failed":
-        return f"{desc} — FAILED ({o['detail'] or 'no reason recorded'})"
+    if o.get("status") == "skipped":
+        return f"{desc} — SKIPPED ({detail or 'no reason recorded'})"
+    if o.get("status") == "failed":
+        return f"{desc} — FAILED ({detail or 'no reason recorded'})"
     return f"{desc} — outcome unknown"
 
 
 def _build_fallback_summary(goal: str, done: list, skipped: list, failed: list) -> str:
     """No LLM call — used when call_llm_text fails/returns nothing, or
     when there's no task_id to look outcomes up for at all. Must be
-    accurate on its own; it's reachable independently of the LLM path."""
+    accurate and informative on its own; it's reachable independently of the LLM path."""
+    if not done and not skipped and not failed:
+        return f"Completed request for: {goal[:60]}, sir."
+
     if not skipped and not failed:
+        if len(done) == 1 and done[0].get("detail"):
+            return done[0]["detail"].strip()
+        details = [o.get("detail", "").strip() for o in done if o.get("detail")]
+        if details:
+            return "; ".join(details)
         return f"All done, sir. Completed {len(done)} step(s) for: {goal[:60]}."
+
     total = len(done) + len(skipped) + len(failed)
     parts = [f"Completed {len(done)} of {total} step(s) for: {goal[:60]}, sir."]
     if skipped:
@@ -375,8 +480,9 @@ def _build_summary_prompt(goal: str, done: list, skipped: list, failed: list) ->
     steps_str = "\n".join(lines) if lines else "(no steps recorded)"
     return (
         f'User goal: "{goal}"\n'
-        f"Step outcomes (accurate — not every step necessarily succeeded):\n{steps_str}\n\n"
-        "Write a single natural sentence summarising what actually happened. "
+        f"Step outcomes and results (accurate — not every step necessarily succeeded):\n{steps_str}\n\n"
+        "Write a single natural, direct, spoken sentence answering the user's request. "
+        "Include the actual result, facts, or data (e.g. weather temperature/conditions, answers found, actions done). "
         "Accurately reflect what was done, what was skipped, and what failed — "
         "do not claim a skipped or failed step was completed. "
         "Address the user as 'sir'."
@@ -399,6 +505,7 @@ class AgentExecutor:
         task_id:     str | None             = None,
         submitted_interactively: bool       = True,
         caller_class: str                   = "desktop",
+        player                              = None,
     ) -> str:
         """caller_class (headless-extraction phase, Step 1.3): who
         submitted this task — one of core/policy.py's CALLER_CLASSES,
@@ -408,6 +515,18 @@ class AgentExecutor:
         audit trail is attributable regardless of which caller_class
         submitted the task (see tests/test_caller_attribution.py's
         Step-1.6-equivalent routing test)."""
+        task_id = task_id or uuid.uuid4().hex[:8]
+        try:
+            conn = get_conn()
+            with conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO tasks "
+                    "(task_id, goal, priority, status, result, error, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (task_id, goal, 2, "running", None, "", time.time(), time.time()),
+                )
+        except Exception:
+            _log.debug("Could not ensure task row for %s", task_id, exc_info=True)
         _log.info("Goal: %s", goal, extra={"task_id": task_id, "caller_class": caller_class})
 
         def _log_event(step_num, tool, desc, status, detail="", duration_ms=None):
@@ -418,6 +537,7 @@ class AgentExecutor:
 
         replan_attempts = 0
         completed_steps: list = []
+        clarified = False
         plan = create_plan(goal, task_id=task_id)
 
         while True:
@@ -451,7 +571,7 @@ class AgentExecutor:
                 tool     = step.get("tool", "generated_code")
                 desc     = step.get("description", "")
                 params   = step.get("parameters", {})
-                params   = _inject_context(params, tool, step_results, goal=goal, task_id=task_id, step_num=step_num)
+                params   = _inject_context(params, tool, step_results, goal=goal, task_id=task_id, step_num=step_num, desc=desc)
 
                 step_start = time.monotonic()
                 attempt    = 1
@@ -494,6 +614,8 @@ class AgentExecutor:
                         result = _call_tool(
                             tool, params, speak, task_id=task_id, step_num=step_num,
                             submitted_interactively=submitted_interactively,
+                            caller_class=caller_class,
+                            player=player,
                         )
 
                         short_circuit = _short_circuit_reason(result, tool)
@@ -671,8 +793,33 @@ class AgentExecutor:
                 if not success:
                     break
 
+            self._last_step_results = step_results
             if success:
                 return self._summarize(goal, speak, task_id=task_id)
+
+            # Clarify-with-user fallback specifically for missing required parameter validation failures
+            missing_param_names = _extract_missing_parameters(failed_error)
+
+            if missing_param_names and not clarified:
+                clarified = True
+                tool_name = (failed_step.get("tool") if failed_step else "") or "the tool"
+                step_desc = (failed_step.get("description") if failed_step else "")
+                question  = _format_clarification_question(tool_name, missing_param_names, step_desc)
+
+                _log.info("Requesting clarification: %s", question, extra={"task_id": task_id})
+                user_response = CONFIRM.request_clarification(player, question, speak=speak)
+
+                if user_response:
+                    _log_event(
+                        failed_step.get("step") if failed_step else None,
+                        tool_name, goal[:200],
+                        "clarified", f"User clarified {missing_param_names}: {user_response[:100]}",
+                    )
+                    if speak:
+                        speak("Thank you, sir. Updating my plan.")
+                    clarified_context = f"Clarification from user for missing {missing_param_names}: {user_response}"
+                    plan = create_plan(goal, context=clarified_context, task_id=task_id)
+                    continue
 
             if replan_attempts >= self.MAX_REPLAN_ATTEMPTS:
                 msg = f"Task failed after {replan_attempts} replan attempts, sir."
@@ -688,17 +835,31 @@ class AgentExecutor:
             replan_attempts += 1
             plan = replan(goal, completed_steps, failed_step, failed_error, task_id=task_id)
 
-    def _summarize(self, goal: str, speak: Callable | None, task_id: str | None = None) -> str:
-        """Sourced from task_events (get_step_outcomes), not from a
-        parallel completed_steps list — completed_steps conflated a
-        genuinely 'done' step with one that was merely 'skipped'
-        (ErrorDecision.SKIP appends to it exactly like a real success
-        does), so both the LLM-fed prompt and the deterministic fallback
-        below used to describe skipped work as accomplished. Both paths
-        are fixed here, not just the LLM one — the fallback has the
-        identical bug and is independently reachable if the LLM call
-        fails."""
+    def _summarize(
+        self,
+        goal: str,
+        speak: Callable | None,
+        task_id: str | None = None,
+        **kwargs,
+    ) -> str:
+        """Sourced from task_events (get_step_outcomes), augmented by
+        in-memory step_results fallback if DB lookup returns empty.
+        Both the LLM-fed prompt and the deterministic fallback return
+        real result content to the user, not just step counts."""
+        step_results = kwargs.get("step_results") or getattr(self, "_last_step_results", None)
         outcomes = get_step_outcomes(task_id)
+        if not outcomes and step_results:
+            outcomes = [
+                {
+                    "step_num": k,
+                    "tool": "action",
+                    "description": goal,
+                    "status": "done",
+                    "detail": str(v),
+                }
+                for k, v in step_results.items()
+            ]
+
         done     = [o for o in outcomes if o["status"] == "done"]
         skipped  = [o for o in outcomes if o["status"] == "skipped"]
         # A 'failed' segment shouldn't normally reach _summarize() — a
@@ -719,7 +880,8 @@ class AgentExecutor:
         prompt = _build_summary_prompt(goal, done, skipped, failed)
         try:
             summary = call_llm_text(prompt, task_id=task_id, purpose="summarize task")
-            if summary:
+            if summary and summary.strip():
+                summary = summary.strip()
                 if speak: speak(summary)
                 return summary
         except Exception:

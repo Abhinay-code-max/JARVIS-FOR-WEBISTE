@@ -412,7 +412,7 @@ class PostconditionFailureRetryWiringTest(unittest.TestCase):
                 "parameters": {"action": "delete"}, "critical": True,
             }]}
 
-        def _fake_dispatch(tool, args, player, speak, task_id=None, submitted_interactively=True):
+        def _fake_dispatch(tool, args, player, speak, task_id=None, submitted_interactively=True, **kwargs):
             calls["n"] += 1
             return "Postcondition unmet — 'file_controller' 'x.txt' still exists after delete. (tool reported: 'Moved to Trash')"
 
@@ -449,7 +449,7 @@ class PostconditionFailureRetryWiringTest(unittest.TestCase):
                 "parameters": {"file_path": "video.mp4", "action": "convert"}, "critical": True,
             }]}
 
-        def _fake_dispatch(tool, args, player, speak, task_id=None, submitted_interactively=True):
+        def _fake_dispatch(tool, args, player, speak, task_id=None, submitted_interactively=True, **kwargs):
             calls["n"] += 1
             if calls["n"] == 1:
                 return "Postcondition unmet — 'file_processor' 'video_converted.mp4' does not exist after convert."

@@ -57,28 +57,24 @@ class VoiceIdentifier:
         if duration < self.MIN_SECONDS:
             return None
 
-        # Strategy 1: SpeechBrain ECAPA-TDNN (best quality, ~100 MB model)
-        try:
-            return self._embed_speechbrain(audio)
-        except ImportError:
-            pass
-        except Exception as e:
-            _log.warning("SpeechBrain error: %s", e)
-
-        # Strategy 2: MFCC cosine (lightweight, always available with librosa)
+        # Strategy 1: MFCC cosine (lightweight, self-contained, always reliable with librosa)
         try:
             return self._embed_mfcc(audio)
-        except ImportError:
-            pass
         except Exception as e:
-            _log.warning("MFCC error: %s", e)
+            _log.warning("MFCC embedding error: %s", e)
+
+        # Strategy 2: SpeechBrain ECAPA-TDNN (if available and configured)
+        try:
+            return self._embed_speechbrain(audio)
+        except Exception as e:
+            _log.debug("SpeechBrain embedding not used: %s", e)
 
         return None
 
     def _embed_speechbrain(self, audio: np.ndarray) -> np.ndarray:
         """ECAPA-TDNN via SpeechBrain — 192-dim x-vector."""
         import torch
-        from speechbrain.pretrained import SpeakerRecognition
+        from speechbrain.inference.speaker import SpeakerRecognition
         if self._model is None:
             self._model = SpeakerRecognition.from_hparams(
                 source="speechbrain/spkrec-ecapa-voxceleb",
@@ -148,6 +144,84 @@ class VoiceIdentifier:
         _log.info("Registered '%s'.", name)
         return True
 
+    # ── Interactive Recording & Registration ──────────────────────────────────
+    def record_sample(self, duration_sec: float = 3.5) -> Optional[np.ndarray]:
+        """Record a single audio clip from the microphone."""
+        try:
+            import sounddevice as sd
+            frames = int(duration_sec * self.SAMPLE_RATE)
+            recording = sd.rec(frames, samplerate=self.SAMPLE_RATE, channels=1, dtype="float32")
+            sd.wait()
+            return recording.flatten()
+        except Exception as e:
+            _log.error("Microphone recording failed: %s", e)
+            return None
+
+    def record_and_register(
+        self,
+        name: str,
+        reps: int = 3,
+        duration_sec: float = 3.5,
+        prompt_cb: Optional[callable] = None,
+    ) -> bool:
+        """
+        Interactive voice enrollment: captures `reps` audio samples from the microphone,
+        averages their embeddings, and saves to recognition/voices/<name>.npy.
+        Mirrors FaceIdentifier.register().
+        """
+        collected = []
+        _log.info("Starting voice enrollment for '%s' (%d samples)…", name, reps)
+
+        for i in range(1, reps + 1):
+            msg = f"Sample {i}/{reps}: Speak clearly into your microphone ({duration_sec:.1f}s)..."
+            if prompt_cb:
+                prompt_cb(msg)
+            else:
+                print(f"\n🎙️  {msg}")
+
+            audio = self.record_sample(duration_sec=duration_sec)
+            if audio is None:
+                _log.warning("Sample %d recording failed.", i)
+                continue
+
+            emb = self._get_embedding(audio)
+            if emb is not None:
+                collected.append(emb)
+                _log.info("Sample %d captured successfully.", i)
+            else:
+                _log.warning("Sample %d audio too short or silent.", i)
+
+        if not collected:
+            _log.error("No valid audio samples captured for '%s'.", name)
+            return False
+
+        mean_emb = np.mean(collected, axis=0)
+        norm = np.linalg.norm(mean_emb)
+        mean_emb = mean_emb / (norm + 1e-9)
+
+        out_path = self._dir / f"{name}.npy"
+        np.save(str(out_path), mean_emb)
+        self._embeddings[name] = mean_emb
+        _log.info("Voice profile registered for '%s' (%d samples averaged).", name, len(collected))
+        return True
+
+    def record_and_identify(
+        self,
+        duration_sec: float = 3.5,
+        prompt_cb: Optional[callable] = None,
+    ) -> tuple[Optional[str], float]:
+        """Record a live microphone sample and test identification against enrolled profiles."""
+        msg = f"Listening for speaker identification ({duration_sec:.1f}s)..."
+        if prompt_cb:
+            prompt_cb(msg)
+        else:
+            print(f"\n🎙️  {msg}")
+
+        audio = self.record_sample(duration_sec=duration_sec)
+        if audio is None:
+            return None, 0.0
+        return self.identify(audio)
+
     # ── Utility ───────────────────────────────────────────────────────────────
     def list_users(self) -> list[str]:
         return list(self._embeddings.keys())
@@ -167,3 +241,74 @@ def _cosine(a: np.ndarray, b: np.ndarray) -> float:
     if na < 1e-9 or nb < 1e-9:
         return 0.0
     return float(np.dot(a, b) / (na * nb))
+
+
+# ── CLI Interface ─────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    import sys
+    import time
+
+    voices_path = Path(__file__).resolve().parent / "voices"
+    identifier = VoiceIdentifier(voices_path)
+
+    cmd = sys.argv[1].lower() if len(sys.argv) > 1 else "enroll"
+    target_name = sys.argv[2] if len(sys.argv) > 2 else "Abhinay"
+
+    if cmd == "list":
+        users = identifier.list_users()
+        print(f"\nEnrolled voice profiles ({len(users)}):")
+        for u in users:
+            print(f"  • {u}")
+
+    elif cmd == "delete":
+        if identifier.delete_user(target_name):
+            print(f"\n✓ Deleted voice profile for '{target_name}'.")
+        else:
+            print(f"\n✗ No voice profile found for '{target_name}'.")
+
+    elif cmd == "test":
+        print("\n--- JARVIS Voice Identification Test ---")
+        name, conf = identifier.record_and_identify(duration_sec=3.5)
+        if name:
+            print(f"\n✓ MATCH FOUND: '{name}' (Confidence: {conf:.1%})")
+        else:
+            print(f"\n✗ UNKNOWN SPEAKER (Highest similarity: {conf:.1%}, Threshold: {identifier.THRESHOLD:.1%})")
+
+    elif cmd == "enroll":
+        print(f"\n========================================")
+        print(f"   JARVIS Voice Enrollment — {target_name}")
+        print(f"========================================")
+        print("You will be asked to speak 3 short phrases.")
+        print("Make sure your microphone is connected and quiet background.\n")
+
+        phrases = [
+            "Hey JARVIS, this is my voice profile sample one.",
+            "JARVIS, initialize system diagnostics and check status.",
+            "I am the primary user of this JARVIS terminal.",
+        ]
+
+        def _prompt(msg: str):
+            print(f"\n>> {msg}")
+
+        ok = identifier.record_and_register(
+            name=target_name,
+            reps=3,
+            duration_sec=3.5,
+            prompt_cb=_prompt,
+        )
+
+        if ok:
+            print(f"\n🎉 SUCCESS: Voice profile for '{target_name}' successfully enrolled!")
+            print(f"Saved to: {voices_path / f'{target_name}.npy'}")
+            print("\nNow testing verification...")
+            time.sleep(1)
+            name, conf = identifier.record_and_identify(duration_sec=3.5, prompt_cb=_prompt)
+            if name:
+                print(f"✓ Verified match: '{name}' ({conf:.1%})")
+            else:
+                print(f"Result: {conf:.1%} confidence.")
+        else:
+            print(f"\n✗ Enrollment failed. Please check microphone settings and try again.")
+    else:
+        print(f"Usage: python -m recognition.voice_id [enroll|test|list|delete] [name]")
+

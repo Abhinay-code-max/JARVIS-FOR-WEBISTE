@@ -76,8 +76,13 @@ def _code_helper(parameters, player, speak):
 
 
 def _dev_agent(parameters, player, speak):
-    from actions.dev_agent import dev_agent
-    return dev_agent(parameters=parameters, player=player, speak=speak) or "Done."
+    from actions.coding_agent import coding_agent
+    return coding_agent(parameters=parameters, player=player, speak=speak) or "Done."
+
+
+def _coding_agent(parameters, player, speak):
+    from actions.coding_agent import coding_agent
+    return coding_agent(parameters=parameters, player=player, speak=speak) or "Done."
 
 
 def _web_search(parameters, player, speak):
@@ -130,6 +135,7 @@ TOOL_DISPATCH: dict[str, Callable[[dict, object, Optional[Callable]], str]] = {
     "desktop_control":   _desktop_control,
     "code_helper":       _code_helper,
     "dev_agent":         _dev_agent,
+    "coding_agent":      _coding_agent,
     "web_search":        _web_search,
     "file_processor":    _file_processor,
     "computer_control":  _computer_control,

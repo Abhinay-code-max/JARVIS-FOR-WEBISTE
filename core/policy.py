@@ -99,6 +99,7 @@ DEFAULT_POLICY: list[tuple[str, str | None, str]] = [
     ("desktop_control", None, ASK_AND_WAIT),
     ("code_helper",      None, ASK_AND_WAIT),
     ("dev_agent",         None, ASK_AND_WAIT),  # delegated — core/tool_gate.DELEGATED_TOOLS
+    ("coding_agent",      None, ASK_AND_WAIT),
     ("vision_fix_code",   None, ASK_AND_WAIT),  # delegated — core/tool_gate.DELEGATED_TOOLS
     ("send_message",       None, ASK_AND_WAIT),
     # Missed in the original permission-model pass — found while building
@@ -195,6 +196,7 @@ SERVICE_POLICY: dict[str, list[tuple[str, str | None, str]]] = {
         # completeness/documentation of intent, not because it's what
         # actually gates these two for this class.
         ("dev_agent",       None, ASK_AND_WAIT),
+        ("coding_agent",    None, ASK_AND_WAIT),
         ("vision_fix_code", None, ASK_AND_WAIT),
         ("file_processor",  None, ASK_AND_WAIT),
         # file_controller: additionally scoped to project directories
@@ -303,10 +305,74 @@ def _ensure_seeded() -> None:
         _seeded_for_path = current_path
 
 
+# Canonical known action sets for action-based tools.
+KNOWN_TOOL_ACTIONS: dict[str, set[str]] = {
+    "computer_control": {
+        "click", "left_click", "double_click", "right_click", "type", "smart_type",
+        "move", "drag", "hotkey", "press", "scroll", "copy", "paste",
+        "screenshot", "wait", "clear_field", "focus_window", "screen_find",
+        "screen_click", "random_data", "user_data",
+    },
+    "file_controller": {
+        "list", "create_file", "create_folder", "delete", "move", "copy",
+        "rename", "read", "write", "find", "largest", "disk_usage",
+        "organize_desktop", "info",
+    },
+    "browser_control": {
+        "switch", "list_browsers", "close_all", "go_to", "search", "click",
+        "type", "scroll", "fill_form", "smart_click", "smart_type", "get_text",
+        "get_url", "press", "new_tab", "close_tab", "screenshot", "back",
+        "forward", "reload", "close",
+    },
+    "desktop_control": {
+        "wallpaper", "wallpaper_url", "current_wallpaper", "organize", "clean",
+        "list", "stats", "task",
+    },
+    "code_helper": {
+        "write", "edit", "explain", "run", "build", "screen_debug", "optimize", "auto",
+    },
+    "game_updater": {
+        "list", "download_status", "schedule", "update", "install", "shutdown_when_done",
+        "cancel_schedule", "schedule_status",
+    },
+    "youtube_video": {
+        "play", "summarize", "get_info", "trending",
+    },
+    "file_processor": {
+        "describe", "ocr", "resize", "convert", "compress", "crop", "summarize",
+        "extract_text", "extract_pages", "to_word", "reformat", "translate_hint",
+        "word_count", "analyze", "filter", "sort", "stats", "validate",
+        "format", "extract", "explain", "review", "fix", "run", "document",
+        "transcribe", "trim", "info", "extract_audio", "extract_frame", "list",
+        "to_pdf", "auto",
+    },
+    "computer_settings": {
+        "volume_set", "type_text", "write_on_screen", "type", "write", "press_key",
+        "reload_n", "refresh_n", "reload_page_n", "scroll_up", "scroll_down",
+        "restart", "shutdown", "brightness_up", "brightness_down", "volume_up",
+        "volume_down", "mute", "unmute", "window_minimize", "window_maximize",
+        "window_restore", "window_close", "show_desktop", "switch_window",
+        "task_view", "tab_next", "tab_prev", "tab_new", "tab_close", "tab_reopen",
+        "copy", "cut", "paste", "select_all", "undo", "redo", "save", "find",
+        "print", "screenshot", "lock", "sleep", "settings", "file_explorer",
+        "task_manager", "zoom_in", "zoom_out", "zoom_reset",
+        "sleep_display", "screen_off", "pause_video", "play_pause", "close_app",
+        "close_window", "full_screen", "fullscreen", "minimize", "maximize",
+        "snap_left", "snap_right", "focus_search", "refresh_page", "reload",
+        "next_tab", "prev_tab", "go_back", "go_forward", "find_on_page",
+        "scroll_top", "scroll_bottom", "page_up", "page_down", "enter", "escape",
+        "lock_screen", "open_settings", "open_run", "dark_mode", "toggle_wifi",
+        "toggle_mute",
+    },
+}
+
+
 def get_policy_level(tool_name: str, action: str | None, caller_class: str = DESKTOP) -> str:
     """Most specific match wins: (tool_name, action, caller_class) row if
-    one exists, else the tool's (tool_name, NULL, caller_class) default
-    row, else a caller-class-dependent fallback:
+    one exists, else if an action was requested but unrecognized on a tool
+    with any ASK_AND_WAIT/HARD_DENY actions defined, fail closed to
+    ASK_AND_WAIT (desktop) or HARD_DENY (service:*), else the tool's
+    (tool_name, NULL, caller_class) default row, else a caller-class-dependent fallback:
       - 'desktop': ask-and-wait — an unlisted tool fails toward asking,
         not toward auto-allow. Exact pre-existing behavior, unchanged.
       - any 'service:*' class: hard-deny — default-deny, explicit
@@ -325,6 +391,21 @@ def get_policy_level(tool_name: str, action: str | None, caller_class: str = DES
         ).fetchone()
         if row:
             return row["level"]
+
+        # Hardened fallback: if an action is looked up and unrecognized for a tool whose
+        # actions are defined, and the tool has any sensitive action tiers (ASK_AND_WAIT/HARD_DENY),
+        # default unrecognized actions to ASK_AND_WAIT (desktop) or HARD_DENY (service:*).
+        is_known_action = (
+            tool_name in KNOWN_TOOL_ACTIONS and action in KNOWN_TOOL_ACTIONS[tool_name]
+        )
+        if not is_known_action:
+            has_sensitive_action = conn.execute(
+                "SELECT 1 FROM permission_policy WHERE tool_name = ? AND action IS NOT NULL AND level IN (?, ?)",
+                (tool_name, ASK_AND_WAIT, HARD_DENY),
+            ).fetchone() is not None
+            if has_sensitive_action:
+                return ASK_AND_WAIT if caller_class == DESKTOP else HARD_DENY
+
     row = conn.execute(
         "SELECT level FROM permission_policy WHERE tool_name = ? AND action IS NULL AND caller_class = ?",
         (tool_name, caller_class),

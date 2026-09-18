@@ -148,5 +148,58 @@ class WeatherReportLoggerTest(unittest.TestCase):
         mock_update_mem.assert_called_once_with({"identity": {"city": "Tokyo"}})
 
 
+    @patch("actions.weather_report._get_user_city", return_value="Hyderabad")
+    @patch("actions.weather_report._get_api_key", return_value="test_key")
+    @patch("actions.weather_report.requests.get")
+    def test_explicit_city_takes_priority_over_saved_memory(self, mock_get, mock_api_key, mock_user_city):
+        """When an explicit city is given, it MUST take priority over the saved memory default."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "name": "Tokyo",
+            "sys": {"country": "JP"},
+            "main": {"temp": 29.0, "feels_like": 32.0, "humidity": 67},
+            "weather": [{"description": "overcast clouds"}],
+            "wind": {"speed": 4.6},
+        }
+        mock_get.return_value = mock_resp
+
+        result = weather_action({"city": "Tokyo"})
+        self.assertIn("Tokyo, JP", result)
+        self.assertNotIn("Hyderabad", result)
+        mock_get.assert_called_once()
+        self.assertEqual(mock_get.call_args[1]["params"]["q"], "Tokyo")
+
+    @patch("actions.weather_report._get_user_city", return_value="Hyderabad")
+    @patch("actions.weather_report._get_api_key", return_value="test_key")
+    @patch("actions.weather_report.requests.get")
+    def test_extracted_city_from_query_takes_priority_over_saved_memory(self, mock_get, mock_api_key, mock_user_city):
+        """When city is in query or description, it extracts and takes priority over saved memory."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "name": "Paris",
+            "sys": {"country": "FR"},
+            "main": {"temp": 22.0, "feels_like": 22.0, "humidity": 55},
+            "weather": [{"description": "clear sky"}],
+            "wind": {"speed": 3.0},
+        }
+        mock_get.return_value = mock_resp
+
+        result = weather_action({"query": "what is the weather in Paris today?"})
+        self.assertIn("Paris, FR", result)
+        self.assertNotIn("Hyderabad", result)
+        mock_get.assert_called_once()
+        self.assertEqual(mock_get.call_args[1]["params"]["q"], "Paris")
+
+    def test_extract_city_from_text_patterns(self):
+        from actions.weather_report import _extract_city_from_text
+        self.assertEqual(_extract_city_from_text("what is the weather in Tokyo?"), "Tokyo")
+        self.assertEqual(_extract_city_from_text("weather for London"), "London")
+        self.assertEqual(_extract_city_from_text("check weather in San Francisco today"), "San Francisco")
+        self.assertEqual(_extract_city_from_text("what is the weather?"), "")
+        self.assertEqual(_extract_city_from_text("how is the weather in my area?"), "")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
